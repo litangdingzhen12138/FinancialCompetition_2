@@ -1,0 +1,23 @@
+__pycache__/
+.pytest_cache/
+.deps/
+*.py[cod]
+*.duckdb
+*.duckdb.wal
+.env
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+
+# Build artifacts
+bank_text2sql.egg-info/
+
+# Tool caches
+.codex_analysis/
+
+# Office temp/lock files
+~$*
+
