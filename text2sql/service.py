@@ -34,17 +34,42 @@ class Text2SQLService:
         self.llm_planner = llm_planner or LLMPlanner(self.settings)
         self.plan_validator = PlanValidator(self.catalog)
         self.sql_guard = SQLGuard(self.settings.default_row_limit, self.settings.hard_row_limit)
-        self.alignment_validator = AlignmentValidator()
+        self.alignment_validator = AlignmentValidator(self.catalog)
         self.result_validator = ResultValidator()
         self.executor = DuckDBExecutor(self.db_path, self.settings.hard_row_limit)
 
-    def _validated_execute(self, plan: QueryPlan, raw_sql: str) -> tuple[str, QueryResult]:
+    def _validated_execute(
+        self,
+        plan: QueryPlan,
+        raw_sql: str,
+        trace: list[dict[str, object]] | None = None,
+    ) -> tuple[str, QueryResult]:
+        if trace is not None:
+            trace.append({"stage": "plan_validation", "plan": plan.to_dict()})
         self.plan_validator.validate(plan)
         approved_sql, expression = self.sql_guard.validate_and_limit(raw_sql)
+        if trace is not None:
+            trace.append({"stage": "sql_guard", "raw_sql": raw_sql, "approved_sql": approved_sql})
         self.alignment_validator.validate(plan, raw_sql, expression)
+        if trace is not None:
+            trace.append({"stage": "alignment_validation", "status": "ok"})
         self.executor.preflight(approved_sql)
+        if trace is not None:
+            trace.append({"stage": "sql_preflight", "status": "ok"})
         result = self.executor.execute(approved_sql)
+        if trace is not None:
+            trace.append(
+                {
+                    "stage": "sql_execution",
+                    "columns": result.columns,
+                    "row_count": result.row_count,
+                    "rows": result.rows[:20],
+                    "rows_truncated_in_trace": result.row_count > 20,
+                }
+            )
         self.result_validator.validate(plan, result)
+        if trace is not None:
+            trace.append({"stage": "result_validation", "status": "ok"})
         return approved_sql, result
 
     def _response(
@@ -74,26 +99,38 @@ class Text2SQLService:
         state: SessionState,
         decision: RuleDecision,
         initial_feedback: str | None,
+        trace: list[dict[str, object]],
     ) -> QueryResponse:
         feedback = initial_feedback
         last_error: Exception | None = None
-        for _ in range(self.settings.llm_retries + 1):
+        for attempt in range(1, self.settings.llm_retries + 2):
             try:
+                trace.append({"stage": "llm_attempt", "attempt": attempt, "feedback": feedback})
                 plan = self.llm_planner.plan(
                     question=question,
                     schema_context=self.catalog.schema_context(question),
                     rule_candidates=decision.candidates,
                     state=state,
                     feedback=feedback,
+                    trace=trace,
                 )
+                trace.append({"stage": "llm_plan", "attempt": attempt, "plan": plan.to_dict()})
                 if not plan.sql:
                     raise ConfigurationError("LLM计划缺少SQL")
-                sql, result = self._validated_execute(plan, plan.sql)
+                sql, result = self._validated_execute(plan, plan.sql, trace)
                 warnings = (f"规则路径降级：{decision.reason}",) if decision.plan else ()
                 return self._response(session_id, plan, sql, result, warnings)
             except Text2SQLError as exc:
                 last_error = exc
                 feedback = retry_feedback(exc)
+                trace.append(
+                    {
+                        "stage": "llm_attempt_error",
+                        "attempt": attempt,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "retry_feedback": feedback,
+                    }
+                )
         if last_error:
             raise last_error
         raise ConfigurationError("LLM兜底未能生成有效查询")
@@ -102,20 +139,54 @@ class Text2SQLService:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("问题不能为空")
         session_id = session_id or uuid.uuid4().hex
+        trace: list[dict[str, object]] = [
+            {"stage": "request", "question": question, "session_id": session_id}
+        ]
+        try:
+            return self._ask(question, session_id, trace)
+        except Exception as exc:
+            trace.append({"stage": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            exc.diagnostics = trace
+            raise
+
+    def _ask(
+        self,
+        question: str,
+        session_id: str,
+        trace: list[dict[str, object]],
+    ) -> QueryResponse:
         state = self.sessions.get(session_id)
+        trace.append(
+            {
+                "stage": "session_state",
+                "last_organizations": state.last_organizations,
+                "last_result_organizations": state.last_result_organizations,
+                "last_metrics": state.last_metrics,
+                "last_date": state.last_date,
+            }
+        )
         decision = self.rule_planner.plan(question, state)
+        trace.append(
+            {
+                "stage": "rule_decision",
+                "reason": decision.reason,
+                "candidates": decision.candidates,
+                "plan": decision.plan.to_dict() if decision.plan else None,
+            }
+        )
         rule_error: Exception | None = None
         if decision.plan is not None:
             try:
                 raw_sql = compile_rule_sql(decision.plan)
+                trace.append({"stage": "rule_sql", "sql": raw_sql})
                 plan = replace(decision.plan, sql=raw_sql)
-                sql, result = self._validated_execute(plan, raw_sql)
+                sql, result = self._validated_execute(plan, raw_sql, trace)
                 return self._response(session_id, plan, sql, result)
             except Text2SQLError as exc:
                 rule_error = exc
+                trace.append({"stage": "rule_error", "error": f"{type(exc).__name__}: {exc}"})
         feedback = retry_feedback(rule_error) if rule_error else decision.reason
-        return self._llm_attempts(question, session_id, state, decision, feedback)
+        return self._llm_attempts(question, session_id, state, decision, feedback, trace)
 
     def clear_session(self, session_id: str) -> None:
         self.sessions.clear(session_id)
-

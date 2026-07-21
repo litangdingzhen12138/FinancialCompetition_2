@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from text2sql.config import Settings
+from text2sql.errors import PlanningError
 from text2sql.models import QueryPlan
 from text2sql.service import Text2SQLService
 
@@ -38,3 +41,21 @@ def test_llm_fallback_uses_the_same_validation_path():
     assert response.route == "llm"
     assert response.answer == "江苏省A市农商行：42.02亿元"
 
+
+class FailingLLMPlanner:
+    def plan(self, **kwargs):
+        raise PlanningError("invalid generated plan")
+
+
+def test_service_attaches_intermediate_diagnostics_to_final_error():
+    settings = replace(Settings.from_env(), llm_retries=0)
+    service = Text2SQLService(settings=settings, llm_planner=FailingLLMPlanner())
+
+    with pytest.raises(PlanningError) as caught:
+        service.ask("规则无法识别的开放问题", "diagnostics")
+
+    stages = [event["stage"] for event in caught.value.diagnostics]
+    assert "rule_decision" in stages
+    assert "llm_attempt" in stages
+    assert "llm_attempt_error" in stages
+    assert stages[-1] == "failed"

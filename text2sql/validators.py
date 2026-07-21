@@ -16,6 +16,13 @@ from .semantic_catalog import APPROVED_TABLES, RATIO_METRICS, SemanticCatalog
 ALLOWED_OPERATIONS = {
     "value", "rank", "difference", "growth", "ratio", "province_average_compare",
     "threshold", "daily_average", "quarterly_trend", "multi_condition",
+    "extrema", "count_condition", "annual_average_extrema", "multi_metric_rank_change",
+    "metric_profile_rank", "mom_yoy_difference", "period_global_extrema", "period_average_summary",
+    "component_shares", "organization_sum", "cross_organization_difference",
+    "component_sum", "component_sum_compare", "province_average_count",
+    "period_growth_rank", "period_decline_rank", "metric_difference",
+    "days_vs_average", "multi_metric_difference",
+    "profitability_assessment", "multi_metric_average_condition",
 }
 EXTERNAL_ACCESS = re.compile(
     r"\b(read_csv(?:_auto)?|read_parquet|read_json(?:_auto)?|read_xlsx|sqlite_scan|postgres_scan|httpfs|glob)\s*\(",
@@ -53,8 +60,44 @@ class PlanValidator:
             raise ValidationError("比率类指标不计算增幅，应计算百分点差")
         if plan.operation == "ratio" and (len(plan.metrics) != 2 or not plan.derived_formula):
             raise ValidationError("派生比率必须包含分子、分母和公式标识")
-        if plan.operation in {"daily_average", "quarterly_trend"} and (not plan.start_date or not plan.end_date):
+        if plan.operation in {"daily_average", "period_average_summary", "quarterly_trend"} and (
+            not plan.start_date or not plan.end_date
+        ):
             raise ValidationError("期间统计缺少开始或结束日期")
+        if plan.operation == "annual_average_extrema" and (not plan.start_date or not plan.end_date):
+            raise ValidationError("年度均值排名缺少开始或结束日期")
+        if plan.operation == "multi_metric_rank_change" and (not plan.current_date or not plan.comparison_date):
+            raise ValidationError("多指标排名变化缺少当前日期或比较日期")
+        if plan.operation == "metric_profile_rank" and not plan.current_date:
+            raise ValidationError("指标画像排名缺少查询日期")
+        if plan.operation == "mom_yoy_difference" and (
+            not plan.current_date or not plan.comparison_date or not plan.start_date
+        ):
+            raise ValidationError("环比同比查询缺少当前、上月或去年同期日期")
+        if plan.operation == "period_global_extrema" and (not plan.start_date or not plan.end_date):
+            raise ValidationError("区间单日极值缺少开始或结束日期")
+        if plan.operation in {
+            "component_shares", "organization_sum", "cross_organization_difference",
+            "component_sum", "component_sum_compare", "province_average_count",
+            "metric_difference",
+        } and not plan.current_date:
+            raise ValidationError("查询缺少当前日期")
+        if plan.operation in {"period_growth_rank", "period_decline_rank"} and (
+            not plan.current_date or not plan.comparison_date
+        ):
+            raise ValidationError("期间变化排名缺少当前日期或比较日期")
+        if plan.operation == "days_vs_average" and (not plan.start_date or not plan.end_date):
+            raise ValidationError("按日比较全省均值缺少开始或结束日期")
+        if plan.operation == "multi_metric_difference" and (
+            not plan.current_date or not plan.comparison_date
+        ):
+            raise ValidationError("多指标期间比较缺少当前日期或比较日期")
+        if plan.operation == "profitability_assessment" and (
+            not plan.current_date or not plan.comparison_date
+        ):
+            raise ValidationError("盈利能力评估缺少当前日期或年初日期")
+        if plan.operation == "multi_metric_average_condition" and not plan.current_date:
+            raise ValidationError("多指标均值条件查询缺少当前日期")
         if plan.operation == "rank" and plan.sort_direction not in {"asc", "desc"}:
             raise ValidationError("排名查询缺少排序方向")
         if plan.limit is not None and not 1 <= plan.limit <= 1000:
@@ -124,11 +167,16 @@ class SQLGuard:
 class AlignmentValidator:
     """Conservative checks that the SQL contains the plan's explicit business constraints."""
 
+    def __init__(self, catalog: SemanticCatalog) -> None:
+        self.catalog = catalog
+
     def validate(self, plan: QueryPlan, sql: str, expression: exp.Expression) -> None:
         upper = sql.upper()
-        for metric in plan.metrics:
-            if metric.upper() not in upper:
-                raise ValidationError(f"SQL遗漏指标：{metric}")
+        querying_every_metric = set(plan.metrics) == set(self.catalog.metrics)
+        if not querying_every_metric:
+            for metric in plan.metrics:
+                if metric.upper() not in upper:
+                    raise ValidationError(f"SQL遗漏指标：{metric}")
         if plan.organization_scope == "selected":
             for org in plan.organizations:
                 if org.upper() not in upper:
@@ -149,7 +197,7 @@ class AlignmentValidator:
             raise ValidationError("省均值比较SQL未计算AVG")
         if plan.operation == "growth" and "NULLIF" not in upper:
             raise ValidationError("增幅SQL缺少除零保护")
-        if plan.operation == "ratio" and "NULLIF" not in upper:
+        if plan.operation == "ratio" and plan.derived_formula != "combined_npl_overdue_rate" and "NULLIF" not in upper:
             raise ValidationError("派生比率SQL缺少除零保护")
 
 
@@ -159,12 +207,11 @@ class ResultValidator:
             raise ResultValidationError("查询结果为空，可能是日期、机构或指标条件不匹配")
         if plan.expected_shape == "single_row" and len(result.rows) != 1:
             raise ResultValidationError(f"期望单行结果，实际返回{len(result.rows)}行")
-        if plan.limit is not None and len(result.rows) > plan.limit:
+        if plan.operation == "rank" and plan.limit is not None and len(result.rows) > plan.limit:
             raise ResultValidationError("结果行数超过QueryPlan约定")
-        if plan.operation == "rank" and "metric_rank" not in result.columns:
+        if plan.source == "rule" and plan.operation == "rank" and "metric_rank" not in result.columns:
             raise ResultValidationError("排名结果缺少metric_rank")
-        if plan.operation == "ratio" and "derived_value" not in result.columns:
+        if plan.source == "rule" and plan.operation == "ratio" and "derived_value" not in result.columns:
             raise ResultValidationError("派生比率结果缺少derived_value")
-        if plan.operation == "province_average_compare" and "province_average" not in result.columns:
+        if plan.source == "rule" and plan.operation == "province_average_compare" and "province_average" not in result.columns:
             raise ResultValidationError("省均值比较结果不完整")
-

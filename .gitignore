@@ -17,6 +17,10 @@ bank_text2sql.egg-info/
 
 # Tool caches
 .codex_analysis/
+.codex_work/
+
+# Generated outputs (previews, workbooks, run artifacts)
+outputs/
 
 # Office temp/lock files
 ~$*

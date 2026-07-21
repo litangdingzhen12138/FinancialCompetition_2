@@ -10,6 +10,7 @@ import requests
 from .config import Settings
 from .errors import ConfigurationError, PlanningError
 from .models import PlanFilter, QueryPlan, SessionState
+from .semantic_catalog import DERIVED_METRICS
 
 
 SYSTEM_PROMPT = """你是银行指标Text2SQL规划器。只输出一个JSON对象，不要Markdown。
@@ -19,7 +20,23 @@ SYSTEM_PROMPT = """你是银行指标Text2SQL规划器。只输出一个JSON对�
 JSON字段：query_type, operation, organizations, organization_scope, metrics, current_date,
 comparison_date, start_date, end_date, dimensions, filters, sort_direction, limit,
 expected_shape, allow_empty, derived_formula, confidence, assumptions, sql。
-filters元素字段为field, operator, value, reference。"""
+filters元素字段为field, operator, value, reference。
+operation只能是value, rank, difference, growth, ratio, province_average_compare,
+threshold, daily_average, quarterly_trend, multi_condition, extrema, count_condition之一。
+organizations、metrics、dimensions、assumptions必须是字符串数组；confidence必须是0到1的数字。"""
+
+
+OPERATION_ALIASES = {
+    "query": "value",
+    "fetch": "value",
+    "compute": "value",
+    "calculate": "value",
+    "proportion": "value",
+    "subtraction": "value",
+    "compare": "value",
+    "compare_with_industry": "province_average_compare",
+    "find_extrema": "extrema",
+}
 
 
 def _extract_json(content: str) -> dict[str, Any]:
@@ -56,8 +73,14 @@ def _assumptions(value: Any) -> tuple[str, ...]:
     raise PlanningError("LLM计划assumptions字段格式错误")
 
 
+def _optional_string(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def parse_llm_plan(content: str) -> QueryPlan:
     value = _extract_json(content)
+    organizations = _strings(value.get("organizations"))
+    metrics = _strings(value.get("metrics"))
     filters: list[PlanFilter] = []
     raw_filters = value.get("filters") or []
     if not isinstance(raw_filters, list):
@@ -66,36 +89,70 @@ def parse_llm_plan(content: str) -> QueryPlan:
         if not isinstance(item, dict) or not isinstance(item.get("field"), str) or not isinstance(item.get("operator"), str):
             raise PlanningError("filter格式错误")
         filters.append(PlanFilter(item["field"], item["operator"], item.get("value"), item.get("reference")))
-    required = ("query_type", "operation", "organization_scope", "expected_shape", "sql")
-    if any(not isinstance(value.get(field), str) or not value[field].strip() for field in required):
-        raise PlanningError("LLM计划缺少关键字符串字段")
+    sql = value.get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        raise PlanningError("LLM计划缺少SQL")
+    query_type = value.get("query_type")
+    if not isinstance(query_type, str) or not query_type.strip():
+        query_type = "llm_query"
+    operation = value.get("operation")
+    if not isinstance(operation, str) or not operation.strip():
+        operation = "value"
+    operation = OPERATION_ALIASES.get(operation.strip().lower(), operation.strip().lower())
+    current_date = _optional_string(value.get("current_date"))
+    comparison_date = _optional_string(value.get("comparison_date"))
+    start_date = _optional_string(value.get("start_date"))
+    end_date = _optional_string(value.get("end_date"))
+    derived_formula = _optional_string(value.get("derived_formula"))
+    recognized_formula = derived_formula in DERIVED_METRICS
+    if operation == "value" and recognized_formula and len(metrics) == 2:
+        operation = "ratio"
+    elif operation == "ratio" and not recognized_formula:
+        operation = "multi_condition"
+        derived_formula = None
+    elif operation in {"difference", "growth"} and (
+        comparison_date is None or derived_formula is not None
+    ):
+        operation = "multi_condition"
+        derived_formula = None
+    elif operation == "rank" and len(metrics) > 1:
+        operation = "multi_condition"
+    organization_scope = value.get("organization_scope")
+    if not isinstance(organization_scope, str) or organization_scope not in {"selected", "all"}:
+        organization_scope = "selected" if organizations else "all"
+    expected_shape = value.get("expected_shape")
+    if not isinstance(expected_shape, str) or expected_shape not in {
+        "single_value", "single_row", "multi_row", "time_series"
+    }:
+        expected_shape = "multi_row"
     try:
-        confidence = float(value.get("confidence", 0.0))
+        raw_confidence = value.get("confidence")
+        confidence = 0.0 if raw_confidence is None else float(raw_confidence)
     except (TypeError, ValueError) as exc:
         raise PlanningError("confidence格式错误") from exc
     limit_value = value.get("limit")
     limit = int(limit_value) if limit_value is not None else None
     return QueryPlan(
         source="llm",
-        query_type=value["query_type"],
-        operation=value["operation"],
-        organizations=_strings(value.get("organizations")),
-        organization_scope=value["organization_scope"],
-        metrics=_strings(value.get("metrics")),
-        current_date=value.get("current_date"),
-        comparison_date=value.get("comparison_date"),
-        start_date=value.get("start_date"),
-        end_date=value.get("end_date"),
+        query_type=query_type,
+        operation=operation,
+        organizations=organizations,
+        organization_scope=organization_scope,
+        metrics=metrics,
+        current_date=current_date,
+        comparison_date=comparison_date,
+        start_date=start_date,
+        end_date=end_date,
         dimensions=_strings(value.get("dimensions")),
         filters=tuple(filters),
-        sort_direction=value.get("sort_direction"),
+        sort_direction=_optional_string(value.get("sort_direction")),
         limit=limit,
-        expected_shape=value["expected_shape"],
+        expected_shape=expected_shape,
         allow_empty=bool(value.get("allow_empty", False)),
-        derived_formula=value.get("derived_formula"),
+        derived_formula=derived_formula,
         confidence=confidence,
         assumptions=_assumptions(value.get("assumptions")),
-        sql=value["sql"].strip(),
+        sql=sql.strip(),
     )
 
 
@@ -114,6 +171,7 @@ class LLMPlanner:
         rule_candidates: dict[str, object],
         state: SessionState,
         feedback: str | None = None,
+        trace: list[dict[str, Any]] | None = None,
     ) -> QueryPlan:
         if not self.available:
             raise ConfigurationError(
@@ -131,26 +189,39 @@ class LLMPlanner:
             },
             "previous_failure": feedback,
         }
-        response = requests.post(
-            self.settings.llm_url,
-            headers={
-                "Authorization": f"Bearer {self.settings.llm_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.settings.llm_model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": json.dumps(payload_context, ensure_ascii=False)},
-                ],
-                "temperature": 0,
-                "stream": False,
-            },
-            timeout=self.settings.llm_timeout_seconds,
-        )
+        if trace is not None:
+            trace.append({"stage": "llm_request", "context": payload_context})
         try:
+            response = requests.post(
+                self.settings.llm_url,
+                headers={
+                    "Authorization": f"Bearer {self.settings.llm_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.settings.llm_model,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": json.dumps(payload_context, ensure_ascii=False)},
+                    ],
+                    "temperature": 0,
+                    "stream": False,
+                    "enable_thinking": False,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=self.settings.llm_timeout_seconds,
+            )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-        except Exception as exc:
+        except requests.RequestException as exc:
+            if trace is not None:
+                trace.append({"stage": "llm_transport_error", "error": f"{type(exc).__name__}: {exc}"})
+            raise PlanningError(f"LLM网络调用失败：{type(exc).__name__}") from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            if trace is not None:
+                trace.append({"stage": "llm_response_error", "error": f"{type(exc).__name__}: {exc}"})
             raise PlanningError(f"LLM调用失败：{type(exc).__name__}") from exc
-        return parse_llm_plan(str(content))
+        raw_content = str(content)
+        if trace is not None:
+            trace.append({"stage": "llm_response", "status_code": response.status_code, "content": raw_content})
+        return parse_llm_plan(raw_content)

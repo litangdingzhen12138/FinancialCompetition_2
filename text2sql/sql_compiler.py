@@ -1,4 +1,4 @@
-"""Deterministic DuckDB SQL compilation from validated rule QueryPlans."""
+"""Compile the small deterministic QueryPlan subset to DuckDB SQL."""
 
 from __future__ import annotations
 
@@ -22,9 +22,9 @@ def _point_sql(plan: QueryPlan) -> str:
         JOIN organizations o ON o.org_id = v.org_id
         JOIN metrics m ON m.metric_id = v.metric_id
         WHERE v.data_date = DATE '{plan.current_date}'
-          AND v.metric_id = '{plan.metrics[0]}'
+          AND v.metric_id IN ({_literals(plan.metrics)})
           {_organization_filter(plan)}
-        ORDER BY o.org_id
+        ORDER BY o.org_id, v.metric_id
     """
 
 
@@ -84,7 +84,10 @@ def _period_sql(plan: QueryPlan) -> str:
 
 def _ratio_sql(plan: QueryPlan) -> str:
     numerator, denominator = plan.metrics
-    multiplier = "100.0" if plan.derived_formula != "profit_per_employee" else "1.0"
+    multiplier = {
+        "profit_per_employee": "1.0",
+        "deposit_per_branch": "10000.0",
+    }.get(plan.derived_formula, "100.0")
     return f"""
         WITH components AS (
             SELECT v.org_id,
@@ -110,20 +113,20 @@ def _province_average_sql(plan: QueryPlan) -> str:
         outside_filter = f"WHERE b.org_id IN ({_literals(plan.organizations)})"
     return f"""
         WITH base AS (
-            SELECT v.org_id, v.metric_value,
-                   AVG(v.metric_value) OVER () AS province_average
+            SELECT v.org_id, v.metric_id, v.metric_value,
+                   AVG(v.metric_value) OVER (PARTITION BY v.metric_id) AS province_average
             FROM metric_values v
             WHERE v.data_date = DATE '{plan.current_date}'
-              AND v.metric_id = '{plan.metrics[0]}'
+              AND v.metric_id IN ({_literals(plan.metrics)})
         )
-        SELECT o.org_id, o.org_name, m.metric_name, m.unit,
+        SELECT o.org_id, o.org_name, m.metric_id, m.metric_name, m.unit,
                b.metric_value, b.province_average,
                b.metric_value - b.province_average AS difference_from_average
         FROM base b
         JOIN organizations o ON o.org_id = b.org_id
-        JOIN metrics m ON m.metric_id = '{plan.metrics[0]}'
+        JOIN metrics m ON m.metric_id = b.metric_id
         {outside_filter}
-        ORDER BY o.org_id
+        ORDER BY o.org_id, m.metric_id
     """
 
 
@@ -173,8 +176,7 @@ def _trend_sql(plan: QueryPlan) -> str:
 
 
 def compile_rule_sql(plan: QueryPlan) -> str:
-    if plan.source != "rule":
-        raise ValueError("only rule plans are compiled deterministically")
+    """Compile only operations owned by the conservative rule layer."""
     if plan.operation == "rank":
         return _ranking_sql(plan)
     if plan.operation in {"difference", "growth"}:
@@ -189,4 +191,6 @@ def compile_rule_sql(plan: QueryPlan) -> str:
         return _daily_average_sql(plan)
     if plan.operation == "quarterly_trend":
         return _trend_sql(plan)
+    if plan.operation != "value":
+        raise ValueError(f"规则编译器不支持操作：{plan.operation}")
     return _point_sql(plan)

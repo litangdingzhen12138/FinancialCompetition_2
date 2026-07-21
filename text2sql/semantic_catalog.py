@@ -31,7 +31,7 @@ METRIC_ALIASES: dict[str, tuple[str, ...]] = {
     "ZB015": ("拨备覆盖率", "拨备"),
     "ZB016": ("资本充足率",),
     "ZB017": ("逾期贷款率", "逾期率"),
-    "ZB018": ("员工人数", "员工数"),
+    "ZB018": ("员工人数", "员工数", "员工"),
     "ZB019": ("网点数量", "网点数", "网点"),
     "ZB020": ("个人客户数", "个人客户数量"),
     "ZB021": ("对公客户数", "对公客户数量"),
@@ -59,8 +59,23 @@ DERIVED_METRICS: dict[str, dict[str, str | tuple[str, ...]]] = {
     "intermediate_income_share": {
         "aliases": ("中间业务收入占营业收入", "中收占比"), "numerator": "ZB007", "denominator": "ZB009", "unit": "%"
     },
+    "net_interest_income_share": {
+        "aliases": ("净利息收入占营业收入", "净利息收入比重"), "numerator": "ZB008", "denominator": "ZB009", "unit": "%"
+    },
     "profit_per_employee": {
         "aliases": ("人均利润",), "numerator": "ZB011", "denominator": "ZB018", "unit": "万元/人"
+    },
+    "npl_balance_share": {
+        "aliases": ("不良贷款余额占贷款总额", "不良余额占贷款"),
+        "numerator": "ZB014", "denominator": "ZB002", "unit": "%"
+    },
+    "deposit_per_branch": {
+        "aliases": ("网点平均存款规模", "平均存款规模（万元/网点）", "平均存款规模(万元/网点)"),
+        "numerator": "ZB001", "denominator": "ZB019", "unit": "万元/网点"
+    },
+    "combined_npl_overdue_rate": {
+        "aliases": ("不良+逾期合计占贷款比", "不良率和逾期率合计"),
+        "numerator": "ZB013", "denominator": "ZB017", "unit": "%"
     },
 }
 
@@ -125,9 +140,8 @@ class SemanticCatalog:
         matches: list[tuple[int, int, str]] = []
         for metric_id, aliases in METRIC_ALIASES.items():
             for alias in aliases:
-                position = question.find(alias)
-                if position >= 0:
-                    matches.append((position, position + len(alias), metric_id))
+                for match in re.finditer(re.escape(alias), question):
+                    matches.append((match.start(), match.end(), metric_id))
         accepted: list[tuple[int, int, str]] = []
         for start, end, metric_id in sorted(matches, key=lambda item: (-(item[1] - item[0]), item[0])):
             if any(not (end <= other_start or start >= other_end) for other_start, other_end, _ in accepted):
@@ -147,7 +161,7 @@ class SemanticCatalog:
         return None
 
     def unit_for_plan(self, metrics: tuple[str, ...], derived_formula: str | None) -> str:
-        if derived_formula:
+        if derived_formula in DERIVED_METRICS:
             return str(DERIVED_METRICS[derived_formula]["unit"])
         if len(metrics) == 1:
             return self.metrics[metrics[0]].unit

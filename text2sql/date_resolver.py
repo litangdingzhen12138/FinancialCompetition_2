@@ -12,6 +12,9 @@ def _iso(year: int, month: int, day: int) -> str:
 
 
 def resolve_date(question: str) -> str | None:
+    match = re.search(r"(20\d{2})年.*上半年末.*(?:年末|年底)", question)
+    if match:
+        return f"{match.group(1)}-12-31"
     match = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日|号)?", question)
     if match:
         return _iso(*map(int, match.groups()))
@@ -60,6 +63,8 @@ def same_period_last_year(current: str) -> str:
 
 
 def comparison_date(question: str, current: str) -> tuple[str | None, str | None]:
+    if re.search(r"上半年末|半年末", question):
+        return f"{date.fromisoformat(current).year}-06-30", "half_year_end"
     if re.search(r"较?年初|从年初|2024年末", question):
         return "2024-12-31", "year_beginning"
     if re.search(r"较?上月|环比|比上个月|与上个月", question):
