@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from threading import RLock
 
-from .models import QueryPlan, QueryResult, SessionState
+from .models import QueryPlan, QueryResult, SessionState, TurnMemory
 
 
 class InMemorySessionStore:
@@ -17,8 +17,16 @@ class InMemorySessionStore:
         with self._lock:
             return deepcopy(self._states.get(session_id, SessionState()))
 
-    def update(self, session_id: str, plan: QueryPlan, result: QueryResult) -> None:
+    def update(
+        self,
+        session_id: str,
+        plan: QueryPlan,
+        result: QueryResult,
+        question: str = "",
+        answer: str = "",
+    ) -> None:
         with self._lock:
+            previous = self._states.get(session_id, SessionState())
             returned_orgs: list[str] = []
             if "org_id" in result.columns:
                 index = result.columns.index("org_id")
@@ -30,11 +38,16 @@ class InMemorySessionStore:
                 last_organizations=plan.organizations,
                 last_metrics=plan.metrics,
                 last_date=plan.current_date,
+                last_comparison_date=plan.comparison_date,
+                last_operation=plan.operation,
                 last_query_type=plan.query_type,
                 last_result_organizations=tuple(returned_orgs),
+                recent_turns=(
+                    *previous.recent_turns,
+                    TurnMemory(question=question, plan=plan, result=result, answer=answer),
+                )[-20:],
             )
 
     def clear(self, session_id: str) -> None:
         with self._lock:
             self._states.pop(session_id, None)
-

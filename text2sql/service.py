@@ -7,9 +7,17 @@ import re
 import uuid
 
 from .answerer import format_answer
+from .business_rules import PROVINCE_ORGANIZATION_COUNT
 from .config import Settings
 from .data_builder import ensure_database
-from .errors import ConfigurationError, ResultValidationError, Text2SQLError, retry_feedback
+from .date_resolver import comparison_date
+from .errors import (
+    ConfigurationError,
+    ResultValidationError,
+    Text2SQLError,
+    ValidationError,
+    retry_feedback,
+)
 from .executor import DuckDBExecutor
 from .llm_planner import LLMPlanner
 from .models import QueryPlan, QueryResponse, QueryResult, SessionState
@@ -70,12 +78,25 @@ class Text2SQLService:
             )
         self.result_validator.validate(plan, result)
         self._validate_rank_semantics(plan, result)
+        self._validate_province_average_semantics(plan, result)
         if trace is not None:
             trace.append({"stage": "result_validation", "status": "ok"})
         return approved_sql, result
 
     @staticmethod
     def _augment_llm_plan(question: str, plan: QueryPlan) -> QueryPlan:
+        if plan.current_date:
+            expected_comparison, comparison_kind = comparison_date(question, plan.current_date)
+            if comparison_kind in {
+                "year_beginning",
+                "previous_month",
+                "previous_quarter",
+                "same_period_last_year",
+            } and plan.comparison_date != expected_comparison:
+                raise ValidationError(
+                    f"{comparison_kind}比较期违反衍生维度说明："
+                    f"应为{expected_comparison}，实际为{plan.comparison_date}"
+                )
         assumptions = list(plan.assumptions)
         if re.search(r"(?:各自在全省|全省\d*家里).*排第几|排名.*(?:怎么变|变化)", question):
             assumptions.append("rank_population_all")
@@ -145,17 +166,69 @@ class Text2SQLService:
         validate_column(plan.current_date, current_rank_index, "当前期")
         validate_column(plan.comparison_date, comparison_rank_index, "比较期")
 
+    def _validate_province_average_semantics(
+        self, plan: QueryPlan, result: QueryResult
+    ) -> None:
+        """Verify every returned province average against all 13 organizations."""
+        if not plan.current_date or "province_average" not in result.columns:
+            return
+        column_map = {name.lower(): index for index, name in enumerate(result.columns)}
+        average_index = column_map["province_average"]
+        metric_index = column_map.get("metric_id")
+        if metric_index is None and len(plan.metrics) != 1:
+            raise ResultValidationError("全省均值结果缺少metric_id，无法验证13家机构口径")
+        quoted_metrics = ", ".join(f"'{metric}'" for metric in plan.metrics)
+        oracle = self.executor.execute(
+            f"""
+            SELECT metric_id, AVG(metric_value) AS province_average,
+                   COUNT(DISTINCT org_id) AS organization_count
+            FROM metric_values
+            WHERE data_date = DATE '{plan.current_date}'
+              AND metric_id IN ({quoted_metrics})
+            GROUP BY metric_id
+            """
+        )
+        expected = {
+            str(metric): (float(average), int(count))
+            for metric, average, count in oracle.rows
+        }
+        for row in result.rows:
+            metric = str(row[metric_index]) if metric_index is not None else plan.metrics[0]
+            expected_average, organization_count = expected.get(metric, (float("nan"), 0))
+            actual_average = row[average_index]
+            if organization_count != PROVINCE_ORGANIZATION_COUNT:
+                raise ResultValidationError(
+                    f"{metric}全省均值仅覆盖{organization_count}家机构，必须覆盖"
+                    f"{PROVINCE_ORGANIZATION_COUNT}家"
+                )
+            if actual_average is None or abs(float(actual_average) - expected_average) > max(
+                1e-9, abs(expected_average) * 1e-9
+            ):
+                raise ResultValidationError(
+                    f"{metric}全省均值口径错误：返回{actual_average}，"
+                    f"13家机构算数平均值应为{expected_average}"
+                )
+
     def _response(
         self,
         session_id: str,
+        question: str,
+        state: SessionState,
         plan: QueryPlan,
         sql: str,
         result: QueryResult,
         warnings: tuple[str, ...] = (),
     ) -> QueryResponse:
-        self.sessions.update(session_id, plan, result)
+        answer = format_answer(
+            plan,
+            result,
+            self.catalog,
+            question=question,
+            history=state.recent_turns,
+        )
+        self.sessions.update(session_id, plan, result, question=question, answer=answer)
         return QueryResponse(
-            answer=format_answer(plan, result, self.catalog),
+            answer=answer,
             session_id=session_id,
             route=plan.source,
             sql=sql,
@@ -201,7 +274,7 @@ class Text2SQLService:
                     raise ConfigurationError("LLM计划缺少SQL")
                 sql, result = self._validated_execute(plan, plan.sql, trace)
                 warnings = (f"规则路径降级：{decision.reason}",) if decision.plan else ()
-                return self._response(session_id, plan, sql, result, warnings)
+                return self._response(session_id, question, state, plan, sql, result, warnings)
             except Text2SQLError as exc:
                 last_error = exc
                 feedback = retry_feedback(exc)
@@ -245,6 +318,9 @@ class Text2SQLService:
                 "last_result_organizations": state.last_result_organizations,
                 "last_metrics": state.last_metrics,
                 "last_date": state.last_date,
+                "last_comparison_date": state.last_comparison_date,
+                "last_operation": state.last_operation,
+                "recent_turn_count": len(state.recent_turns),
             }
         )
         decision = self.rule_planner.plan(question, state)
@@ -263,7 +339,7 @@ class Text2SQLService:
                 trace.append({"stage": "rule_sql", "sql": raw_sql})
                 plan = replace(decision.plan, sql=raw_sql)
                 sql, result = self._validated_execute(plan, raw_sql, trace)
-                return self._response(session_id, plan, sql, result)
+                return self._response(session_id, question, state, plan, sql, result)
             except Text2SQLError as exc:
                 rule_error = exc
                 trace.append({"stage": "rule_error", "error": f"{type(exc).__name__}: {exc}"})

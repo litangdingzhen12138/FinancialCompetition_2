@@ -65,8 +65,19 @@ class SessionState:
     last_organizations: tuple[str, ...] = ()
     last_metrics: tuple[str, ...] = ()
     last_date: str | None = None
+    last_comparison_date: str | None = None
+    last_operation: str | None = None
     last_query_type: str | None = None
     last_result_organizations: tuple[str, ...] = ()
+    recent_turns: tuple["TurnMemory", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TurnMemory:
+    question: str
+    plan: QueryPlan
+    result: QueryResult
+    answer: str
 
 
 @dataclass(frozen=True, slots=True)

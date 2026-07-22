@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .business_rules import PERFORMANCE_BAD_COUNT, PERFORMANCE_GOOD_MAX_RANK
 from .models import QueryPlan
 from .date_resolver import same_period_last_year
 from .semantic_catalog import COMPOSITION_METRICS, LOWER_IS_BETTER
@@ -38,12 +39,27 @@ def _ranking_sql(plan: QueryPlan) -> str:
     if rank_all_then_filter:
         outside_conditions.append(f"org_id IN ({_literals(plan.organizations)})")
     if plan.limit:
-        outside_conditions.append(f"metric_rank <= {plan.limit}")
+        if "select_bottom_rank" in plan.assumptions:
+            outside_conditions.append(f"metric_rank >= population_size - {plan.limit - 1}")
+        elif "select_highest_value" in plan.assumptions or "select_lowest_value" in plan.assumptions:
+            outside_conditions.append(f"selection_rank <= {plan.limit}")
+        else:
+            outside_conditions.append(f"metric_rank <= {plan.limit}")
     outside_filter = f"WHERE {' AND '.join(outside_conditions)}" if outside_conditions else ""
+    selection_direction = "ASC" if "select_lowest_value" in plan.assumptions else "DESC"
+    order_expression = (
+        "metric_rank DESC, org_id"
+        if "select_bottom_rank" in plan.assumptions
+        else "selection_rank, org_id"
+        if "select_highest_value" in plan.assumptions or "select_lowest_value" in plan.assumptions
+        else "metric_rank, org_id"
+    )
     return f"""
         WITH ranked AS (
             SELECT o.org_id, o.org_name, m.metric_name, m.unit, v.metric_value,
-                   RANK() OVER (ORDER BY v.metric_value {direction}) AS metric_rank
+                   RANK() OVER (ORDER BY v.metric_value {direction}) AS metric_rank,
+                   RANK() OVER (ORDER BY v.metric_value {selection_direction}) AS selection_rank,
+                   COUNT(*) OVER () AS population_size
             FROM metric_values v
             JOIN organizations o ON o.org_id = v.org_id
             JOIN metrics m ON m.metric_id = v.metric_id
@@ -54,7 +70,7 @@ def _ranking_sql(plan: QueryPlan) -> str:
         SELECT org_id, org_name, metric_name, unit, metric_value, metric_rank
         FROM ranked
         {outside_filter}
-        ORDER BY metric_value {direction}, org_id
+        ORDER BY {order_expression}
     """
 
 
@@ -120,6 +136,7 @@ def _ratio_sql(plan: QueryPlan) -> str:
     multiplier = {
         "profit_per_employee": "1.0",
         "deposit_per_branch": "10000.0",
+        "profit_deposit_ratio": "0.01",
     }.get(plan.derived_formula, "100.0")
     return f"""
         WITH components AS (
@@ -144,17 +161,25 @@ def _province_average_sql(plan: QueryPlan) -> str:
     outside_filter = ""
     if plan.organization_scope == "selected":
         outside_filter = f"WHERE b.org_id IN ({_literals(plan.organizations)})"
+    lower_metrics = _literals(tuple(metric for metric in plan.metrics if metric in LOWER_IS_BETTER)) or "''"
     return f"""
         WITH base AS (
             SELECT v.org_id, v.metric_id, v.metric_value,
-                   AVG(v.metric_value) OVER (PARTITION BY v.metric_id) AS province_average
+                   AVG(v.metric_value) OVER (PARTITION BY v.metric_id) AS province_average,
+                   RANK() OVER (
+                       PARTITION BY v.metric_id
+                       ORDER BY
+                           CASE WHEN v.metric_id IN ({lower_metrics}) THEN v.metric_value END ASC,
+                           CASE WHEN v.metric_id NOT IN ({lower_metrics}) THEN v.metric_value END DESC
+                   ) AS metric_rank
             FROM metric_values v
             WHERE v.data_date = DATE '{plan.current_date}'
               AND v.metric_id IN ({_literals(plan.metrics)})
         )
         SELECT o.org_id, o.org_name, m.metric_id, m.metric_name, m.unit,
                b.metric_value, b.province_average,
-               b.metric_value - b.province_average AS difference_from_average
+               b.metric_value - b.province_average AS difference_from_average,
+               b.metric_rank
         FROM base b
         JOIN organizations o ON o.org_id = b.org_id
         JOIN metrics m ON m.metric_id = b.metric_id
@@ -175,6 +200,19 @@ def _threshold_sql(plan: QueryPlan) -> str:
           AND v.metric_id = '{plan.metrics[0]}'
           {_organization_filter(plan)}
         ORDER BY o.org_id
+    """
+
+
+def _threshold_count_sql(plan: QueryPlan) -> str:
+    condition = plan.filters[0]
+    return f"""
+        SELECT COUNT(*) FILTER (
+                   WHERE v.metric_value {condition.operator} {float(condition.value)}
+               ) AS matching_organizations,
+               COUNT(*) AS total_organizations
+        FROM metric_values v
+        WHERE v.data_date = DATE '{plan.current_date}'
+          AND v.metric_id = '{plan.metrics[0]}'
     """
 
 
@@ -442,12 +480,22 @@ def _multi_period_change_sql(plan: QueryPlan) -> str:
 
 def _period_change_rank_sql(plan: QueryPlan) -> str:
     is_decrease = "rank_decrease" in plan.assumptions
+    is_absolute = "rank_absolute_change" in plan.assumptions
     if is_decrease:
         result_expression = "comparison_value - current_value"
         result_unit = "个百分点"
+    elif is_absolute:
+        result_expression = "current_value - comparison_value"
+        result_unit = None
     else:
         result_expression = "(current_value - comparison_value) / NULLIF(comparison_value, 0) * 100.0"
         result_unit = "%"
+    outside_filter = (
+        f"WHERE r.org_id IN ({_literals(plan.organizations)})"
+        if plan.organization_scope == "selected"
+        else f"WHERE r.result_rank <= {plan.limit or 3}"
+    )
+    unit_expression = "m.unit" if result_unit is None else f"'{result_unit}'"
     return f"""
         WITH values_by_org AS (
             SELECT v.org_id,
@@ -465,11 +513,11 @@ def _period_change_rank_sql(plan: QueryPlan) -> str:
         )
         SELECT r.org_id, o.org_name, m.metric_name,
                r.comparison_value, r.current_value, r.result_value,
-               '{result_unit}' AS unit, r.result_rank
+               {unit_expression} AS unit, r.result_rank
         FROM ranked r
         JOIN organizations o ON o.org_id = r.org_id
         JOIN metrics m ON m.metric_id = '{plan.metrics[0]}'
-        WHERE r.result_rank <= {plan.limit or 3}
+        {outside_filter}
         ORDER BY r.result_rank, r.org_id
     """
 
@@ -526,9 +574,8 @@ def _performance_profile_sql(plan: QueryPlan) -> str:
         SELECT r.org_id, o.org_name, r.metric_id, m.metric_name, m.unit,
                r.metric_value, r.province_average, r.metric_rank,
                CASE
-                   WHEN r.metric_id = 'ZB016' THEN '中性'
-                   WHEN r.metric_rank <= CEIL(r.population_size / 2.0) THEN '较好'
-                   WHEN r.metric_rank >= r.population_size - 3 THEN '较差'
+                   WHEN r.metric_rank <= {PERFORMANCE_GOOD_MAX_RANK} THEN '较好'
+                   WHEN r.metric_rank >= r.population_size - {PERFORMANCE_BAD_COUNT - 1} THEN '较差'
                    ELSE '中性'
                END AS performance_label
         FROM ranked r
@@ -550,7 +597,8 @@ def _major_operating_profile_sql(plan: QueryPlan) -> str:
                        ORDER BY
                            CASE WHEN v.metric_id IN ({lower_metrics}) THEN v.metric_value END ASC,
                            CASE WHEN v.metric_id NOT IN ({lower_metrics}) THEN v.metric_value END DESC
-                   ) AS metric_rank
+                   ) AS metric_rank,
+                   COUNT(*) OVER (PARTITION BY v.metric_id) AS population_size
             FROM metric_values v
             WHERE v.data_date = DATE '{plan.current_date}'
               AND v.metric_id IN ({_literals(plan.metrics)})
@@ -564,9 +612,8 @@ def _major_operating_profile_sql(plan: QueryPlan) -> str:
                c.metric_value, c.province_average, c.metric_rank,
                p.comparison_value, c.metric_value - p.comparison_value AS change_value,
                CASE
-                   WHEN c.metric_id NOT IN ('ZB001','ZB002','ZB011','ZB012','ZB013','ZB015') THEN '中性'
-                   WHEN c.metric_rank <= 7 THEN '较好'
-                   WHEN c.metric_rank >= 10 THEN '较差'
+                   WHEN c.metric_rank <= {PERFORMANCE_GOOD_MAX_RANK} THEN '较好'
+                   WHEN c.metric_rank >= c.population_size - {PERFORMANCE_BAD_COUNT - 1} THEN '较差'
                    ELSE '中性'
                END AS performance_label
         FROM current_ranked c
@@ -665,6 +712,8 @@ def compile_rule_sql(plan: QueryPlan) -> str:
         return _multi_metric_province_compare_sql(plan)
     if plan.operation == "threshold":
         return _threshold_sql(plan)
+    if plan.operation == "count_condition":
+        return _threshold_count_sql(plan)
     if plan.operation == "daily_average":
         return _daily_average_sql(plan)
     if plan.operation == "sum":
@@ -680,7 +729,7 @@ def compile_rule_sql(plan: QueryPlan) -> str:
             return _major_operating_profile_sql(plan)
         if "profitability_profile" in plan.assumptions:
             return _profitability_profile_sql(plan)
-        if "performance_profile" in plan.assumptions:
+        if "performance_profile" in plan.assumptions or "risk_profile" in plan.assumptions:
             return _performance_profile_sql(plan)
         raise ValueError("规则画像缺少类型标识")
     if plan.operation == "cross_difference":

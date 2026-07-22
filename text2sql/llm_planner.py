@@ -7,16 +7,19 @@ from typing import Any
 
 import requests
 
+from .business_rules import derived_rule_prompt
 from .config import Settings
 from .errors import ConfigurationError, PlanningError
 from .models import PlanFilter, QueryPlan, SessionState
 from .semantic_catalog import DERIVED_METRICS
 
 
-SYSTEM_PROMPT = """你是银行指标Text2SQL规划器。只输出一个JSON对象，不要Markdown。
+SYSTEM_PROMPT = f"""你是银行指标Text2SQL规划器。只输出一个JSON对象，不要Markdown。
 只能使用提供的DuckDB Schema，不能发明表、列、指标或机构。SQL只能是一条SELECT或WITH...SELECT。
 必须同时输出结构化QueryPlan和sql。数值必须由数据库查询，不能凭记忆回答。
 比率指标的变化使用百分点差，不计算增幅；不良贷款率、逾期贷款率、成本收入比越低越好。
+衍生维度必须严格服从下列业务契约，不得根据年份或问题自行改写：
+{derived_rule_prompt()}
 JSON字段：query_type, operation, organizations, organization_scope, metrics, current_date,
 comparison_date, start_date, end_date, dimensions, filters, sort_direction, limit,
 expected_shape, allow_empty, derived_formula, confidence, assumptions, sql。
@@ -28,6 +31,10 @@ SQL结果必须使用清晰稳定的列别名；金额或比率结果应同时�
 metric_id、metric_name、unit、metric_value、result_value、count_value、metric_rank、data_date等通用别名，
 使结果无需针对具体问题编写格式化代码。多指标且单位不同时，优先每行返回一个指标的长表结构；
 如必须横向展开，每个数值字段必须有对应的<字段前缀>_unit列。
+跨单位金额比率必须先统一量纲，并保证公式与unit完全一致。例如净利润单位为万元、存款单位为亿元时，
+若返回百分比，应计算“净利润/(存款*10000)*100”，unit必须为“%”；不得把无量纲结果标成“万元/亿元”。
+CTE和表别名必须使用非保留英文名称（如base_data、aggregated_values、pv）；禁止把DuckDB保留字
+用作未加引号的标识符，尤其禁止使用pivot、unpivot作为裸CTE名或表别名。
 必须覆盖问题中的每个子问题：若同时询问“哪些机构”和“一共有几家”，结果必须同时返回机构列表和总数；
 若同时询问两家谁高和相差多少，结果必须包含两家数值及差值；若询问趋势的最高和最低，必须返回可确定极值的完整序列。
 只返回用户要求的指标，不得额外返回其他指标。计算某机构的全省排名时，必须先对全省机构做窗口排名，
@@ -194,6 +201,22 @@ class LLMPlanner:
                 "last_result_organizations": state.last_result_organizations,
                 "last_metrics": state.last_metrics,
                 "last_date": state.last_date,
+                "last_comparison_date": state.last_comparison_date,
+                "last_operation": state.last_operation,
+                "recent_turns": [
+                    {
+                        "question": turn.question,
+                        "answer": turn.answer[:1000],
+                        "plan": {
+                            "organizations": turn.plan.organizations,
+                            "metrics": turn.plan.metrics,
+                            "current_date": turn.plan.current_date,
+                            "comparison_date": turn.plan.comparison_date,
+                            "operation": turn.plan.operation,
+                        },
+                    }
+                    for turn in state.recent_turns[-20:]
+                ],
             },
             "previous_failure": feedback,
         }

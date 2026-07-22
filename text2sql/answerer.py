@@ -6,8 +6,10 @@ renderer so new SQL shapes do not require adding a question-specific branch.
 
 from __future__ import annotations
 
-from .models import QueryPlan, QueryResult
-from .semantic_catalog import RATIO_METRICS, SemanticCatalog
+import re
+
+from .models import QueryPlan, QueryResult, TurnMemory
+from .semantic_catalog import LOWER_IS_BETTER, RATIO_METRICS, SemanticCatalog
 
 
 def _number(value: object, digits: int = 2) -> str:
@@ -72,6 +74,109 @@ def _generic_answer(
     catalog: SemanticCatalog,
 ) -> str:
     """Render arbitrary read-only result shapes without interpreting new semantics."""
+    if len(rows) > 1 and all(
+        row.get("metric_name") is not None and row.get("result_value") is not None
+        for row in rows
+    ):
+        pieces = []
+        for row in rows:
+            row_unit = str(row.get("unit") or "")
+            value = row["result_value"]
+            digits = (
+                4
+                if row_unit == "%" and isinstance(value, (int, float)) and 0 < abs(float(value)) < 0.1
+                else 2
+            )
+            pieces.append(f"{row['metric_name']}为{_number(value, digits)}{row_unit}")
+        fallback_org = catalog.organizations.get(plan.organizations[0], "") if len(plan.organizations) == 1 else ""
+        return f"{fallback_org}：{'；'.join(pieces)}"
+    if rows and all(
+        "metric_name" in row and any(key.lower() == "condition_met" for key in row)
+        for row in rows
+    ):
+        pieces: list[str] = []
+        statuses: list[bool] = []
+        for row in rows:
+            metric_id = str(row.get("metric_id") or "")
+            value = row.get("metric_value", row.get("result_value"))
+            row_unit = str(row.get("unit") or (
+                catalog.metrics[metric_id].unit if metric_id in catalog.metrics else ""
+            ))
+            average = next(
+                (
+                    row.get(key)
+                    for key in ("province_average", "province_avg", "average_value")
+                    if row.get(key) is not None
+                ),
+                None,
+            )
+            text = f"{row['metric_name']}{_value(value, row_unit)}"
+            if average is not None and value is not None:
+                relation = "低于" if float(value) < float(average) else "高于"
+                text += f"（{relation}全省均值{_value(average, row_unit)}）"
+            raw_status = next(value for key, value in row.items() if key.lower() == "condition_met")
+            met = raw_status is True or str(raw_status).strip().lower() in {
+                "true", "1", "是", "满足", "达标",
+            }
+            statuses.append(met)
+            pieces.append(f"{text}，{'满足' if met else '不满足'}条件")
+        fallback_org = catalog.organizations.get(plan.organizations[0], "") if len(plan.organizations) == 1 else ""
+        conclusion = "同时满足全部条件" if all(statuses) else "未同时满足全部条件"
+        return f"{fallback_org}：{'；'.join(pieces)}；综合判定：{conclusion}"
+    if len(rows) == 1 and any(key.lower() == "meets_all_conditions" for key in rows[0]):
+        normalized = {key.lower().replace("_", ""): value for key, value in rows[0].items()}
+
+        column_aliases = {
+            "ZB013": ("zb013", "npl", "nonperformingloan", "buliang"),
+            "ZB015": ("zb015", "provisioncoverage", "coverage", "bobei"),
+            "ZB016": ("zb016", "capitaladequacy", "capital", "ziben"),
+            "ZB012": ("zb012", "costincome", "cir", "chengben"),
+        }
+
+        def metric_value(metric_id: str, suffix: str = "value") -> object | None:
+            exact = normalized.get(f"{metric_id.lower()}{suffix.lower()}")
+            if exact is not None:
+                return exact
+            aliases = column_aliases[metric_id]
+            for key, value in normalized.items():
+                if not any(alias in key for alias in aliases):
+                    continue
+                is_average = any(token in key for token in ("provinceavg", "provinceaverage", "average", "avg"))
+                if suffix == "value" and not is_average and (
+                    key in aliases or key.endswith(("value", "rate", "ratio"))
+                ):
+                    return value
+                if suffix == "provinceavg" and is_average:
+                    return value
+            return None
+
+        pieces: list[str] = []
+        for metric_id, label in (
+            ("ZB013", "不良贷款率"),
+            ("ZB015", "拨备覆盖率"),
+            ("ZB016", "资本充足率"),
+            ("ZB012", "成本收入比"),
+        ):
+            value = metric_value(metric_id)
+            if value is None:
+                continue
+            text = f"{label}{_value(value, '%')}"
+            province_average = metric_value(metric_id, "provinceavg")
+            if province_average is not None:
+                relation = "低于" if float(value) < float(province_average) else "高于"
+                text += f"（{relation}全省均值{_value(province_average, '%')}）"
+            pieces.append(text)
+        raw_status = next(
+            value for key, value in rows[0].items() if key.lower() == "meets_all_conditions"
+        )
+        meets = raw_status is True or str(raw_status).strip().lower() in {"true", "1", "是", "满足", "达标"}
+        org_name = str(rows[0].get("org_name") or (
+            catalog.organizations.get(plan.organizations[0], "") if len(plan.organizations) == 1 else ""
+        ))
+        details = "，".join(pieces)
+        conclusion = "同时满足全部四项条件" if meets else "未同时满足全部四项条件"
+        if details:
+            return f"{org_name}：{details}；综合判定：{conclusion}"
     if "rank_population_all" in plan.assumptions:
         column_names = set(rows[0]) if rows else set()
         if {"metric_name", "current_rank", "previous_rank"}.issubset(column_names):
@@ -121,10 +226,23 @@ def _generic_answer(
             ]
             if matching_units:
                 field_unit = max(matching_units)[1]
+            elif normalized in {
+                "result_value", "metric_value", "current_value", "comparison_value", "change_value"
+            } and row.get("unit"):
+                field_unit = str(row["unit"])
             elif any(token in normalized for token in ("rate", "ratio", "share", "percent", "pct")):
                 field_unit = "%"
             if field_unit and isinstance(value, (int, float)) and not isinstance(value, bool) and not is_dimension:
-                rendered = _value(value, field_unit)
+                digits = (
+                    4
+                    if (
+                        field_unit == "%"
+                        or any(token in normalized for token in ("rate", "ratio", "share", "percent", "pct"))
+                    )
+                    and 0 < abs(float(value)) < 0.1
+                    else 2
+                )
+                rendered = f"{_number(value, digits)}{field_unit}"
             elif normalized.endswith("rate") and value is not None:
                 rendered = _value(value, "%")
             fields.append(f"{label}={rendered}")
@@ -141,7 +259,7 @@ def _generic_answer(
     return answer
 
 
-def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog) -> str:
+def _format_answer_core(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog) -> str:
     rows = result.dictionaries()
     unit = catalog.unit_for_plan(plan.metrics, plan.derived_formula)
     required_columns = {
@@ -163,11 +281,15 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
             {"matching_days", "total_days", "matching_percentage"}
             if plan.start_date else {"matching_organizations", "total_organizations"}
         ),
+        "count_condition": {"matching_organizations", "total_organizations"},
         "profile": {"org_name", "metric_id", "metric_name", "metric_value", "metric_rank"},
         "cross_difference": {"metric_name", "metric_value", "difference_value"},
         "period_rank_extremes": {"org_name", "average_value", "rank_type", "metric_rank"},
         "period_extrema": {"org_name", "data_date", "metric_value", "extrema_type"},
         "multi_period_change": {"metric_name", "comparison_value", "current_value", "change_value"},
+        "multi_rank_change": {
+            "metric_name", "comparison_value", "current_value", "previous_rank", "current_rank"
+        },
         "period_change_rank": {"org_name", "result_value", "result_rank"},
         "multi_rank": {"metric_name", "metric_value", "metric_rank"},
         "three_dimension_profile": {"metric_id", "metric_name", "metric_value", "metric_rank"},
@@ -186,6 +308,7 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
         "multi_period_change", "period_change_rank", "multi_rank",
         "three_dimension_profile", "reconcile",
         "multi_metric_province_compare",
+        "count_condition", "multi_rank_change",
     }:
         return _generic_answer(plan, rows, catalog)
     if plan.operation == "multi_metric_province_compare":
@@ -201,10 +324,13 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
                 f"（{relation_by_metric[metric_id]}全省均值"
                 f"{_value(row['province_average'], str(row.get('unit') or ''))}）"
             )
-        return "；".join(
+        answer = "；".join(
             f"{org_name}：{'，'.join(values)}"
             for org_name, values in organizations.items()
         )
+        if "require_organization_count" in plan.assumptions:
+            answer += f"；共{len(organizations)}家"
+        return answer
     if plan.operation == "sum":
         pieces = []
         by_organization = len(plan.organizations) > 1 and len(plan.metrics) == 1
@@ -239,6 +365,16 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
         return (
             f"{row['org_name']}：{_number(row['matching_days'], 0)}天{relation}全省均值"
             f"（共{_number(row['total_days'], 0)}天，占比{_number(row['matching_percentage'])}%）"
+        )
+    if plan.operation == "count_condition":
+        row = rows[0]
+        condition = plan.filters[0]
+        metric_name = catalog.metrics[plan.metrics[0]].name
+        condition_text = {"<": "低于", "<=": "不高于", ">": "高于", ">=": "不低于"}[condition.operator]
+        return (
+            f"{metric_name}{condition_text}{_number(condition.value)}%的共有"
+            f"{_number(row['matching_organizations'], 0)}家（全省"
+            f"{_number(row['total_organizations'], 0)}家）"
         )
     if plan.operation == "profile":
         by_metric = {str(row["metric_id"]): row for row in rows}
@@ -334,13 +470,48 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
                 f"{_value(row['current_value'], str(row.get('unit') or ''))}）"
             )
         return "，".join(pieces)
+    if plan.operation == "multi_rank_change":
+        pieces = []
+        for row in rows:
+            current = float(row["current_value"])
+            comparison = float(row["comparison_value"])
+            change = current - comparison
+            lower_is_better = str(row.get("metric_id") or plan.metrics[0]) in LOWER_IS_BETTER
+            improved = change < 0 if lower_is_better else change > 0
+            assessment = "改善" if improved else "恶化" if change else "持平"
+            previous_rank = int(row["previous_rank"])
+            current_rank = int(row["current_rank"])
+            movement = previous_rank - current_rank
+            rank_text = (
+                f"提升{movement}名" if movement > 0
+                else f"下降{abs(movement)}名" if movement < 0
+                else "排名不变"
+            )
+            metric_id = str(row.get("metric_id") or plan.metrics[0])
+            change_unit = "个百分点" if metric_id in RATIO_METRICS else str(row.get("unit") or unit)
+            pieces.append(
+                f"{row['metric_name']}：第{previous_rank}名→第{current_rank}名，"
+                f"{'排名' if movement else ''}{rank_text}（"
+                f"{_value(row['comparison_value'], str(row.get('unit') or unit))}→"
+                f"{_value(row['current_value'], str(row.get('unit') or unit))}，"
+                f"{assessment}{_number(abs(change))}{change_unit}）"
+            )
+        return "；".join(pieces)
     if plan.operation == "period_change_rank":
-        action = "下降" if "rank_decrease" in plan.assumptions else "增长"
-        return "；".join(
-            f"第{_number(row['result_rank'], 0)}名 {row['org_name']}："
-            f"{action}{_value(row['result_value'], str(row.get('unit') or ''))}"
-            for row in rows
-        )
+        pieces = []
+        for row in rows:
+            value = float(row["result_value"])
+            if "rank_decrease" in plan.assumptions:
+                action = "下降"
+            elif "rank_absolute_change" in plan.assumptions:
+                action = "增加" if value >= 0 else "减少"
+            else:
+                action = "增长" if value >= 0 else "下降"
+            pieces.append(
+                f"第{_number(row['result_rank'], 0)}名 {row['org_name']}："
+                f"{action}{_value(abs(value), str(row.get('unit') or ''))}"
+            )
+        return "；".join(pieces)
     if plan.operation == "multi_rank":
         return "；".join(
             f"{row['metric_name']}：{_value(row['metric_value'], str(row.get('unit') or ''))}，"
@@ -434,7 +605,11 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
             )
         return "；".join(pieces)
     if plan.operation == "ratio":
-        return "；".join(f"{row['org_name']}：{_value(row['derived_value'], unit)}" for row in rows)
+        return "；".join(
+            f"{row['org_name']}："
+            f"{_number(row['derived_value'], 4 if unit == '%' and 0 < abs(float(row['derived_value'])) < 0.1 else 2)}{unit}"
+            for row in rows
+        )
     if plan.operation == "province_average_compare":
         pieces = []
         for row in rows:
@@ -442,8 +617,13 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
             relation = "高于" if difference > 0 else "低于" if difference < 0 else "等于"
             metric_id = str(row.get("metric_id") or plan.metrics[0])
             difference_unit = "个百分点" if metric_id in RATIO_METRICS else str(row.get("unit") or unit)
+            rank_text = (
+                f"全省第{_number(row['metric_rank'], 0)}名，"
+                if "rank_population_all" in plan.assumptions and row.get("metric_rank") is not None
+                else ""
+            )
             pieces.append(
-                f"{row['org_name']}：{_value(row['metric_value'], str(row.get('unit') or unit))}，"
+                f"{row['org_name']}：{_value(row['metric_value'], str(row.get('unit') or unit))}，{rank_text}"
                 f"{relation}全省均值{_difference_number(abs(difference))}{difference_unit}"
                 f"（全省均值{_value(row['province_average'], str(row.get('unit') or unit))}）"
             )
@@ -481,3 +661,150 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
             )
         )
     return "；".join(pieces)
+
+
+def _facts_from_result(
+    plan: QueryPlan,
+    result: QueryResult,
+    catalog: SemanticCatalog,
+) -> list[dict[str, object]]:
+    name_to_id = {definition.name: metric_id for metric_id, definition in catalog.metrics.items()}
+    facts: list[dict[str, object]] = []
+    for row in result.dictionaries():
+        metric_id = str(row.get("metric_id") or "")
+        if metric_id not in catalog.metrics:
+            metric_id = plan.metrics[0] if len(plan.metrics) == 1 else name_to_id.get(str(row.get("metric_name") or ""), "")
+        if metric_id not in catalog.metrics:
+            continue
+        value = next(
+            (
+                row.get(key)
+                for key in ("metric_value", "current_value", "result_value", "derived_value")
+                if row.get(key) is not None
+            ),
+            None,
+        )
+        facts.append(
+            {
+                "metric_id": metric_id,
+                "value": value,
+                "unit": str(row.get("unit") or catalog.metrics[metric_id].unit),
+                "rank": next(
+                    (
+                        row.get(key)
+                        for key in ("metric_rank", "current_rank", "result_rank")
+                        if row.get(key) is not None
+                    ),
+                    None,
+                ),
+                "province_average": next(
+                    (
+                        row.get(key)
+                        for key in (
+                            "province_average", "province_avg", "province_avg_value",
+                            "province_average_value", "average_value",
+                        )
+                        if row.get(key) is not None
+                    ),
+                    None,
+                ),
+                "org_id": str(row.get("org_id") or (plan.organizations[0] if len(plan.organizations) == 1 else "")),
+            }
+        )
+    return facts
+
+
+def _collect_metric_facts(
+    plan: QueryPlan,
+    result: QueryResult,
+    history: tuple[TurnMemory, ...],
+    catalog: SemanticCatalog,
+) -> dict[str, dict[str, object]]:
+    target_org = plan.organizations[0] if len(plan.organizations) == 1 else ""
+    collected: dict[str, dict[str, object]] = {}
+    sources = [(turn.plan, turn.result) for turn in history] + [(plan, result)]
+    for source_plan, source_result in sources:
+        for fact in _facts_from_result(source_plan, source_result, catalog):
+            if target_org and fact["org_id"] and fact["org_id"] != target_org:
+                continue
+            metric_id = str(fact["metric_id"])
+            previous = collected.get(metric_id, {})
+            collected[metric_id] = {
+                key: value if value is not None and value != "" else previous.get(key)
+                for key, value in {**previous, **fact}.items()
+            }
+    return collected
+
+
+def _risk_summary(facts: dict[str, dict[str, object]]) -> str:
+    npl = facts.get("ZB013")
+    coverage = facts.get("ZB015")
+    capital = facts.get("ZB016")
+    pieces: list[str] = []
+    if npl and npl.get("value") is not None:
+        rank = f"、全省第{_number(npl['rank'], 0)}名" if npl.get("rank") is not None else ""
+        pieces.append(f"不良贷款率{_value(npl['value'], '%')}{rank}，低于5%监管上限")
+    if coverage and coverage.get("value") is not None:
+        rank = f"、全省第{_number(coverage['rank'], 0)}名" if coverage.get("rank") is not None else ""
+        status = "达到" if float(coverage["value"]) >= 150 else "未达到"
+        pieces.append(f"拨备覆盖率{_value(coverage['value'], '%')}{rank}，{status}150%要求")
+    if capital and capital.get("value") is not None:
+        rank = f"、全省第{_number(capital['rank'], 0)}名" if capital.get("rank") is not None else ""
+        status = "达到" if float(capital["value"]) >= 10.5 else "未达到"
+        pieces.append(f"资本充足率{_value(capital['value'], '%')}{rank}，{status}10.5%要求")
+    ranks = [int(fact["rank"]) for fact in (npl, coverage) if fact and fact.get("rank") is not None]
+    if len(ranks) == 2 and max(ranks) <= 3:
+        conclusion = "是全省风控表现最优的机构之一"
+    elif len(ranks) == 2 and min(ranks) >= 11:
+        conclusion = "两项核心风险指标虽达监管要求，但在全省排名靠后，风险抵补能力相对较弱"
+    elif coverage and coverage.get("rank") == 1:
+        conclusion = "拨备覆盖率全省领先，风险抵补能力突出"
+    else:
+        conclusion = "整体风险指标处于可控范围"
+    return "，".join(pieces) + f"；{conclusion}" if pieces else conclusion
+
+
+def _overall_summary(facts: dict[str, dict[str, object]]) -> str:
+    parts: list[str] = []
+    for metric_id in ("ZB001", "ZB011"):
+        fact = facts.get(metric_id)
+        if fact and fact.get("value") is not None:
+            parts.append(
+                f"{'存款' if metric_id == 'ZB001' else '净利润'}"
+                f"{_value(fact['value'], str(fact.get('unit') or ''))}"
+            )
+    for metric_id, label in (("ZB013", "不良率"), ("ZB015", "拨备"), ("ZB016", "资本")):
+        fact = facts.get(metric_id)
+        if fact and fact.get("rank") is not None:
+            parts.append(f"{label}全省第{_number(fact['rank'], 0)}名")
+    cost = facts.get("ZB012")
+    if cost and cost.get("value") is not None:
+        relation = "低于" if cost.get("province_average") is not None and float(cost["value"]) < float(cost["province_average"]) else "高于"
+        parts.append(f"成本收入比{_value(cost['value'], '%')}{relation}全省均值")
+    return "、".join(parts) + "，风控与经营效率兼优，综合经营质量较为均衡"
+
+
+def format_answer(
+    plan: QueryPlan,
+    result: QueryResult,
+    catalog: SemanticCatalog,
+    *,
+    question: str = "",
+    history: tuple[TurnMemory, ...] = (),
+) -> str:
+    answer = _format_answer_core(plan, result, catalog)
+    facts = _collect_metric_facts(plan, result, history, catalog)
+    if re.search(r"达标|监管(?:线|要求|标准|上限)", question) and len(plan.metrics) == 1:
+        thresholds = {"ZB013": ("低于", 5.0, "上限"), "ZB015": ("不低于", 150.0, "要求"), "ZB016": ("不低于", 10.5, "要求")}
+        rule = thresholds.get(plan.metrics[0])
+        fact = facts.get(plan.metrics[0])
+        if rule and fact and fact.get("value") is not None:
+            operator, threshold, label = rule
+            value = float(fact["value"])
+            met = value < threshold if plan.metrics[0] == "ZB013" else value >= threshold
+            answer += f"；{'达到' if met else '未达到'}监管标准（{operator}{_number(threshold)}%{label}）"
+    if re.search(r"风控|风险画像|风控表现", question):
+        answer += f"。综合判断：{_risk_summary(facts)}"
+    if re.search(r"一句话总结|整体画像", question):
+        answer += f"。一句话：{_overall_summary(facts)}"
+    return answer

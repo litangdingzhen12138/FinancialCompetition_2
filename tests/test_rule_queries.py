@@ -3,7 +3,10 @@ from __future__ import annotations
 import duckdb
 import pytest
 
-from text2sql.models import SessionState
+from text2sql.answerer import format_answer
+from text2sql.date_resolver import comparison_date, resolve_date
+from text2sql.models import QueryPlan, SessionState
+from text2sql.sql_compiler import compile_rule_sql
 
 
 def test_point_query(service):
@@ -26,7 +29,7 @@ def test_top_one_keeps_all_tied_organizations(service):
     response = service.ask("2026年4月15日，全省13家农商行里逾期贷款率最高的是哪家？", "rank-tie")
     assert response.route == "rule"
     assert [row[1] for row in response.rows] == ["江苏省D市农商行", "江苏省I市农商行"]
-    assert all(row[-1] == 1 for row in response.rows)
+    assert all(row[-1] == 12 for row in response.rows)
 
 
 def test_period_difference(service):
@@ -70,6 +73,249 @@ def test_multi_turn_pronoun_inherits_result_orgs_and_date(service):
     assert second.plan["current_date"] == "2026-03-31"
     assert set(second.plan["organizations"]) == {"ORG003", "ORG006", "ORG007"}
     assert "0.88%" in second.answer
+
+
+def test_contextual_quarter_end_uses_previous_year_and_period(service):
+    state = SessionState(
+        last_organizations=("ORG003",),
+        last_metrics=("ZB011",),
+        last_date="2025-09-30",
+    )
+
+    decision = service.rule_planner.plan(
+        "那四季度末呢？相比三季度是继续上升还是回落了？",
+        state,
+    )
+
+    assert decision.plan is not None
+    assert decision.plan.operation == "difference"
+    assert decision.plan.current_date == "2025-12-31"
+    assert decision.plan.comparison_date == "2025-09-30"
+
+
+def test_quarter_followup_returns_quarter_end_change_not_daily_dump(service):
+    state = SessionState(
+        last_organizations=("ORG003",),
+        last_metrics=("ZB011",),
+        last_date="2025-12-31",
+    )
+
+    decision = service.rule_planner.plan(
+        "进入2026年一季度，C市净利润又怎么变了？",
+        state,
+    )
+
+    assert decision.plan is not None
+    assert decision.plan.operation == "difference"
+    assert decision.plan.current_date == "2026-03-31"
+    assert decision.plan.comparison_date == "2025-12-31"
+
+
+def test_referenced_increment_rank_keeps_subject_and_ranks_all_banks(service):
+    state = SessionState(
+        last_organizations=("ORG003",),
+        last_metrics=("ZB011",),
+        last_date="2026-03-31",
+        last_comparison_date="2024-12-31",
+        last_operation="difference",
+    )
+
+    decision = service.rule_planner.plan("这个增量在全省13家里排第几？", state)
+
+    assert decision.plan is not None
+    assert decision.plan.operation == "period_change_rank"
+    assert decision.plan.organization_scope == "selected"
+    assert decision.plan.organizations == ("ORG003",)
+    assert decision.plan.current_date == "2026-03-31"
+    assert decision.plan.comparison_date == "2024-12-31"
+    assert "rank_absolute_change" in decision.plan.assumptions
+    sql = compile_rule_sql(decision.plan)
+    _, result = service._validated_execute(decision.plan, sql)
+    assert result.rows[0][-1] == 2
+    assert round(float(result.rows[0][result.columns.index("result_value")]), 2) == 25.68
+
+
+def test_metric_rank_change_uses_metric_direction_and_previous_context_date(service):
+    state = SessionState(
+        last_organizations=("ORG004",),
+        last_metrics=("ZB015",),
+        last_date="2025-03-31",
+    )
+    decision = service.rule_planner.plan(
+        "到2025年末，D市的不良率是改善了还是恶化了？排名变化？",
+        state,
+    )
+
+    assert decision.plan is not None
+    assert decision.plan.operation == "multi_rank_change"
+    sql = compile_rule_sql(decision.plan)
+    _, result = service._validated_execute(decision.plan, sql)
+    answer = format_answer(decision.plan, result, service.catalog)
+    assert "1.6%" in answer
+    assert "1.62%" in answer
+    assert "恶化0.02个百分点" in answer
+    assert "第13名→第13名" in answer
+
+
+def test_threshold_count_returns_aggregate_instead_of_each_bank(service):
+    response = service.ask(
+        "全省2026年4月末资本充足率低于10.5%最低要求的有几家？",
+        "capital-threshold-count",
+    )
+
+    assert response.route == "rule"
+    assert response.plan["operation"] == "count_condition"
+    assert response.rows == ((0, 13),)
+    assert response.answer == "资本充足率低于10.5%的共有0家（全省13家）"
+
+
+def test_inherited_subject_is_not_expanded_to_all_for_rank_or_average(service):
+    state = SessionState(
+        last_organizations=("ORG012",),
+        last_metrics=("ZB015",),
+        last_date="2026-04-30",
+    )
+
+    rank = service.rule_planner.plan("资本充足率排名如何？是否达标？", state).plan
+    average = service.rule_planner.plan(
+        "成本管控效率怎么样？2026年4月末成本收入比与全省均值比？",
+        state,
+    ).plan
+
+    assert rank is not None and rank.organization_scope == "selected"
+    assert rank.organizations == ("ORG012",)
+    assert average is not None and average.organization_scope == "selected"
+    assert average.organizations == ("ORG012",)
+
+
+def test_rank_question_focuses_on_the_metric_nearest_the_rank_request(service):
+    decision = service.rule_planner.plan(
+        "J市利润亮眼，风控如何？2025年三季度末拨备覆盖率是多少、全省第几？",
+        SessionState(),
+    )
+
+    assert decision.plan is not None
+    assert decision.plan.operation == "rank"
+    assert decision.plan.metrics == ("ZB015",)
+    assert decision.plan.organizations == ("ORG010",)
+
+
+def test_profit_deposit_ratio_uses_compatible_units(service):
+    response = service.ask(
+        "L市2026年4月末的净利润/存款比约为多少？",
+        "profit-deposit-ratio",
+    )
+
+    assert response.route == "rule"
+    assert response.plan["derived_formula"] == "profit_deposit_ratio"
+    assert "0.0232%" in response.answer
+
+
+def test_two_explicit_dates_are_remembered_for_the_next_subject(service):
+    first = service.ask(
+        "L市2024年末和2026年4月末的不良率分别是多少？",
+        "two-date-context",
+    )
+    second = service.ask("K市同期变化情况呢？", "two-date-context")
+
+    assert first.route == "rule"
+    assert "1.3%" in second.answer
+    assert "1.24%" in second.answer
+    assert "0.06个百分点" in second.answer
+
+
+def test_explicit_comparison_quarter_is_not_mistaken_for_current_quarter(service):
+    state = SessionState(
+        last_organizations=("ORG010",),
+        last_metrics=("ZB011",),
+        last_date="2026-03-31",
+    )
+
+    plan = service.rule_planner.plan(
+        "2026年一季度末的净利润相比2025年四季度末又怎么变了？",
+        state,
+    ).plan
+
+    assert plan is not None
+    assert plan.current_date == "2026-03-31"
+    assert plan.comparison_date == "2025-12-31"
+
+
+def test_rank_and_province_average_are_returned_together(service):
+    service.ask("江苏省C市农商行2025年三季度末的净利润是多少？", "rank-average")
+    response = service.ask(
+        "这个利润水平在全省同期排第几？比全省平均高多少？",
+        "rank-average",
+    )
+
+    assert response.route == "rule"
+    assert "全省第1名" in response.answer
+    assert "高于全省均值121.41万元" in response.answer
+
+
+def test_composite_derived_question_does_not_drop_the_difference(service):
+    state = SessionState(
+        last_organizations=("ORG003",),
+        last_metrics=("ZB001",),
+        last_date="2026-03-31",
+    )
+    decision = service.rule_planner.plan(
+        "结合前面提到的季度高点，C市净利润从2025年三季度287.85万元的高点回落到2026年一季度的279.95万元，回落了多少？"
+        "以同期存款115.81亿元看，净利润/存款比约为多少？",
+        state,
+    )
+
+    assert decision.plan is None
+    assert "派生" in decision.reason
+
+
+def test_explicit_comparison_wins_over_background_trend_word(service):
+    state = SessionState(
+        last_organizations=("ORG003",),
+        last_metrics=("ZB011",),
+        last_date="2026-03-31",
+    )
+    plan = service.rule_planner.plan(
+        "尽管逐季有所回落，但和2024年末比，2026年一季度净增长了多少？",
+        state,
+    ).plan
+
+    assert plan is not None
+    assert plan.operation == "difference"
+    assert plan.comparison_date == "2024-12-31"
+
+
+def test_selected_rank_without_top_n_does_not_filter_out_the_subject(service):
+    state = SessionState(
+        last_organizations=("ORG012",),
+        last_metrics=("ZB013",),
+        last_date="2026-04-30",
+    )
+    decision = service.rule_planner.plan("拨备覆盖率呢？全省排名？", state)
+
+    assert decision.plan is not None
+    assert decision.plan.limit is None
+    sql = compile_rule_sql(decision.plan)
+    _, result = service._validated_execute(decision.plan, sql)
+    assert result.rows[0][-1] == 3
+
+
+def test_date_resolution_is_not_tied_to_the_benchmark_year():
+    question = "2028年二季度末的数值相比2027年末变化了多少？"
+
+    current = resolve_date(question)
+    comparison, kind = comparison_date(question, current or "")
+
+    assert current == "2028-06-30"
+    assert comparison == "2027-12-31"
+    assert kind == "explicit_comparison"
+
+
+def test_year_beginning_uses_fixed_workbook_baseline():
+    comparison, kind = comparison_date("较年初增长了多少？", "2029-08-31")
+
+    assert comparison == "2024-12-31"
+    assert kind == "year_beginning"
 
 
 def test_query_database_does_not_import_gold_answers(service):
@@ -295,7 +541,7 @@ def test_performance_profile_has_valid_metric_plan(service):
         "performance-profile",
     )
     assert response.route == "rule"
-    assert "表现较好：无" in response.answer
+    assert "表现较好：资本充足率（第1名）" in response.answer
     assert "不良贷款率（第13名）" in response.answer
     assert "净利润（第11名）" in response.answer
 
@@ -304,6 +550,30 @@ def test_performance_profile_has_valid_metric_plan(service):
         "performance-profile-bottom-four",
     )
     assert "表现较差：拨备覆盖率（第10名）" in later.answer
+
+
+@pytest.mark.parametrize(
+    ("question", "session_id"),
+    [
+        (
+            "江苏省D市农商行在2026-01-31的表现较好和较差的指标分别有哪些？",
+            "performance-contract",
+        ),
+        (
+            "请列出江苏省G市农商行在2025-11-30的主要经营指标及排名，哪些指标表现较好，哪些表现较差？",
+            "major-profile-contract",
+        ),
+    ],
+)
+def test_profile_labels_follow_top_three_and_bottom_four(service, question, session_id):
+    response = service.ask(question, session_id)
+    rank_index = response.columns.index("metric_rank")
+    label_index = response.columns.index("performance_label")
+
+    for row in response.rows:
+        rank = int(row[rank_index])
+        expected = "较好" if rank <= 3 else "较差" if rank >= 10 else "中性"
+        assert row[label_index] == expected
 
 
 def test_joint_metric_province_average_conditions_are_local_and_readable(service):

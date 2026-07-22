@@ -27,17 +27,28 @@ def _json_safe(value: object) -> object:
 
 
 def _feedback(exc: Exception) -> str | None:
-    if type(exc).__name__ not in {"BinderException", "CatalogException", "ConversionException"}:
+    error_type = type(exc).__name__
+    if error_type not in {
+        "BinderException", "CatalogException", "ConversionException", "ParserException"
+    }:
         return None
+    raw_message = re.sub(r"\s+", " ", str(exc)).strip()
     identifiers: list[str] = []
-    for identifier in SAFE_IDENTIFIER.findall(str(exc)[:4000]):
+    for identifier in SAFE_IDENTIFIER.findall(raw_message[:4000]):
         if identifier not in identifiers:
             identifiers.append(identifier)
         if len(identifiers) == 8:
             break
     detail = f"；相关标识符：{', '.join(identifiers)}" if identifiers else ""
+    if error_type == "ParserException":
+        source_detail = f"；DuckDB原始错误：{raw_message[:280]}" if raw_message else ""
+        return (
+            f"DuckDB ParserException{detail}{source_detail}；"
+            "请检查SQL语法；CTE和表别名不得使用未加引号的DuckDB保留字"
+            "（如pivot、unpivot），可改用pv、base_data等名称。"
+        )[:500]
     return (
-        f"DuckDB {type(exc).__name__}{detail}；请仅使用Schema中的表和列，检查CTE、别名、类型与作用域。"
+        f"DuckDB {error_type}{detail}；请仅使用Schema中的表和列，检查CTE、别名、类型与作用域。"
     )[:500]
 
 
@@ -81,4 +92,3 @@ class DuckDBExecutor:
             ) from exc
         finally:
             connection.close()
-

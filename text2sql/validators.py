@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 from datetime import date
+from functools import lru_cache
 import re
 
+import duckdb
 from sqlglot import exp, parse
 from sqlglot.errors import ParseError
 
+from .business_rules import (
+    PERFORMANCE_BAD_COUNT,
+    PERFORMANCE_GOOD_MAX_RANK,
+    PROVINCE_ORGANIZATION_COUNT,
+)
 from .errors import ResultValidationError, SQLSafetyError, ValidationError
 from .models import QueryPlan, QueryResult
 from .semantic_catalog import APPROVED_TABLES, RATIO_METRICS, SemanticCatalog
@@ -27,6 +34,62 @@ EXTERNAL_ACCESS = re.compile(
     r"\b(read_csv(?:_auto)?|read_parquet|read_json(?:_auto)?|read_xlsx|sqlite_scan|postgres_scan|httpfs|glob)\s*\(",
     re.IGNORECASE,
 )
+
+
+def _is_zero_literal(node: exp.Expression) -> bool:
+    return isinstance(node, exp.Literal) and node.is_number and float(node.this) == 0.0
+
+
+def _division_is_zero_safe(division: exp.Div) -> bool:
+    """Accept NULLIF or an enclosing CASE that guards this denominator at zero."""
+    denominator = division.expression
+    if any(True for _ in denominator.find_all(exp.Nullif)):
+        return True
+    denominator_columns = {
+        column.name.lower() for column in denominator.find_all(exp.Column) if column.name
+    }
+    ancestor = division.parent
+    while ancestor is not None:
+        if isinstance(ancestor, exp.Case):
+            for equality in ancestor.find_all(exp.EQ):
+                if _is_zero_literal(equality.this):
+                    guarded_side = equality.expression
+                elif _is_zero_literal(equality.expression):
+                    guarded_side = equality.this
+                else:
+                    continue
+                guarded_columns = {
+                    column.name.lower()
+                    for column in guarded_side.find_all(exp.Column)
+                    if column.name
+                }
+                if denominator_columns & guarded_columns:
+                    return True
+            return False
+        ancestor = ancestor.parent
+    return False
+
+
+def _validate_safe_divisions(expression: exp.Expression, operation_label: str) -> None:
+    divisions = list(expression.find_all(exp.Div))
+    if not divisions:
+        raise ValidationError(f"{operation_label}SQL缺少除法计算")
+    if any(not _division_is_zero_safe(division) for division in divisions):
+        raise ValidationError(f"{operation_label}SQL缺少分母为零保护")
+
+
+@lru_cache(maxsize=1)
+def _duckdb_reserved_keywords() -> frozenset[str]:
+    """Use the installed DuckDB version as the source of truth for reserved words."""
+    connection = duckdb.connect(":memory:")
+    try:
+        rows = connection.execute(
+            "SELECT keyword_name FROM duckdb_keywords() WHERE keyword_category = 'reserved'"
+        ).fetchall()
+    finally:
+        connection.close()
+    # Keep the two table-operator keywords guarded across DuckDB version metadata changes.
+    return frozenset(str(row[0]).lower() for row in rows) | {"pivot", "unpivot"}
 
 
 class PlanValidator:
@@ -103,8 +166,15 @@ class PlanValidator:
             )
         ):
             raise ValidationError("多指标省均值联合条件不完整")
-        if plan.operation == "rank" and plan.sort_direction not in {"asc", "desc"}:
-            raise ValidationError("排名查询缺少排序方向")
+        if plan.operation == "rank":
+            if len(plan.metrics) != 1:
+                raise ValidationError("单次排名只能包含一个指标")
+            expected_direction = self.catalog.metrics[plan.metrics[0]].sort_direction
+            if plan.sort_direction != expected_direction:
+                raise ValidationError(
+                    "排名方向违反衍生维度说明："
+                    f"{plan.metrics[0]}必须使用{expected_direction}"
+                )
         if plan.limit is not None and not 1 <= plan.limit <= 1000:
             raise ValidationError("返回数量不合法")
 
@@ -137,6 +207,19 @@ class SQLGuard:
         )
         if any(isinstance(node, forbidden_types) for node in expression.walk()):
             raise SQLSafetyError("SQL包含禁止的写入或管理操作")
+        reserved_aliases = {
+            alias.this.name.lower()
+            for alias in expression.find_all(exp.TableAlias)
+            if isinstance(alias.this, exp.Identifier)
+            and not alias.this.args.get("quoted")
+            and alias.this.name.lower() in _duckdb_reserved_keywords()
+        }
+        if reserved_aliases:
+            names = "、".join(sorted(reserved_aliases))
+            raise SQLSafetyError(
+                f"CTE或表别名“{names}”是未加引号的DuckDB保留字；"
+                "请改用非保留名称（如pv、base_data），或对名称加双引号。"
+            )
         cte_names = {cte.alias_or_name.lower() for cte in expression.find_all(exp.CTE) if cte.alias_or_name}
         for table in expression.find_all(exp.Table):
             name = table.name.lower()
@@ -205,6 +288,8 @@ class AlignmentValidator:
             if value and value not in sql:
                 raise ValidationError(f"SQL遗漏日期条件：{value}")
         if plan.operation == "rank":
+            if not any(True for _ in expression.find_all(exp.Rank)):
+                raise ValidationError("排名SQL必须按照衍生维度说明使用RANK算法")
             orders = list(expression.find_all(exp.Ordered))
             if not orders:
                 raise ValidationError("排名SQL缺少ORDER BY")
@@ -232,14 +317,24 @@ class AlignmentValidator:
                     and any(token in predicate.this.sql().lower() for token in ("rank", "row_num", "rn"))
                     for predicate in expression.find_all(exp.LT)
                 )
-                if not (has_limit or has_rank_filter or has_strict_rank_filter):
+                has_bottom_rank_filter = (
+                    "select_bottom_rank" in plan.assumptions
+                    and any(
+                        "rank" in predicate.this.sql().lower()
+                        and "population" in predicate.expression.sql().lower()
+                        for predicate in expression.find_all(exp.GTE)
+                    )
+                )
+                if not (
+                    has_limit or has_rank_filter or has_strict_rank_filter or has_bottom_rank_filter
+                ):
                     raise ValidationError("排名SQL遗漏Top-N限制")
         if plan.operation in {"province_average_compare", "multi_metric_province_compare"} and "AVG" not in upper:
             raise ValidationError("省均值比较SQL未计算AVG")
-        if plan.operation == "growth" and "NULLIF" not in upper:
-            raise ValidationError("增幅SQL缺少除零保护")
-        if plan.operation == "ratio" and "NULLIF" not in upper:
-            raise ValidationError("派生比率SQL缺少除零保护")
+        if plan.operation == "growth":
+            _validate_safe_divisions(expression, "增幅")
+        if plan.operation == "ratio":
+            _validate_safe_divisions(expression, "派生比率")
 
 
 class ResultValidator:
@@ -249,11 +344,16 @@ class ResultValidator:
         if plan.expected_shape == "single_row" and len(result.rows) != 1:
             raise ResultValidationError(f"期望单行结果，实际返回{len(result.rows)}行")
         if plan.operation == "rank" and plan.limit is not None and len(result.rows) > plan.limit:
-            if "metric_rank" not in result.columns:
-                raise ResultValidationError("结果行数超过QueryPlan约定")
-            rank_index = result.columns.index("metric_rank")
-            if any(row[rank_index] is None or int(row[rank_index]) > plan.limit for row in result.rows):
-                raise ResultValidationError("结果包含Top-N范围之外的排名")
+            preserves_boundary_ties = any(
+                assumption in plan.assumptions
+                for assumption in ("select_highest_value", "select_lowest_value", "select_bottom_rank")
+            )
+            if not preserves_boundary_ties:
+                if "metric_rank" not in result.columns:
+                    raise ResultValidationError("结果行数超过QueryPlan约定")
+                rank_index = result.columns.index("metric_rank")
+                if any(row[rank_index] is None or int(row[rank_index]) > plan.limit for row in result.rows):
+                    raise ResultValidationError("结果包含Top-N范围之外的排名")
         if plan.source == "rule" and plan.operation == "rank" and "metric_rank" not in result.columns:
             raise ResultValidationError("排名结果缺少metric_rank")
         if plan.source == "rule" and plan.operation == "ratio" and "derived_value" not in result.columns:
@@ -292,7 +392,11 @@ class ResultValidator:
         if "metric_id" in result.columns:
             metric_index = result.columns.index("metric_id")
             returned_metrics = {str(row[metric_index]) for row in result.rows if row[metric_index] is not None}
-            unexpected_metrics = returned_metrics - set(plan.metrics)
+            unexpected_metrics = {
+                metric
+                for metric in returned_metrics - set(plan.metrics)
+                if re.fullmatch(r"ZB\d+", metric, re.IGNORECASE)
+            }
             if unexpected_metrics:
                 raise ResultValidationError(f"查询结果包含计划外指标：{sorted(unexpected_metrics)}")
         if plan.organization_scope == "selected" and "org_id" in result.columns:
@@ -303,3 +407,23 @@ class ResultValidator:
                 raise ResultValidationError(f"查询结果包含计划外机构：{sorted(unexpected_orgs)}")
         if "require_organization_list" in plan.assumptions and not ({"org_id", "org_name"} & set(result.columns)):
             raise ResultValidationError("问题同时要求机构名单和数量，但结果缺少机构列表")
+        if "performance_label" in result.columns:
+            if "metric_rank" not in result.columns:
+                raise ResultValidationError("表现分类缺少metric_rank，无法验证前三/后四口径")
+            rank_index = result.columns.index("metric_rank")
+            label_index = result.columns.index("performance_label")
+            bad_rank_minimum = PROVINCE_ORGANIZATION_COUNT - PERFORMANCE_BAD_COUNT + 1
+            for row in result.rows:
+                rank = int(row[rank_index])
+                expected_label = (
+                    "较好"
+                    if rank <= PERFORMANCE_GOOD_MAX_RANK
+                    else "较差"
+                    if rank >= bad_rank_minimum
+                    else "中性"
+                )
+                if row[label_index] != expected_label:
+                    raise ResultValidationError(
+                        f"表现分类违反前三/后四口径：第{rank}名应为{expected_label}，"
+                        f"实际为{row[label_index]}"
+                    )

@@ -11,7 +11,7 @@ from calendar import monthrange
 from dataclasses import dataclass
 import re
 
-from .date_resolver import comparison_date, resolve_date
+from .date_resolver import comparison_date, resolve_date, year_beginning
 from .models import PlanFilter, QueryPlan, SessionState
 from .semantic_catalog import (
     COMPOSITION_METRICS,
@@ -19,8 +19,10 @@ from .semantic_catalog import (
     PERFORMANCE_PROFILE_METRICS,
     PROFITABILITY_METRICS,
     RATIO_METRICS,
+    RISK_PROFILE_METRICS,
     THREE_DIMENSION_METRICS,
     MAJOR_OPERATING_METRICS,
+    METRIC_ALIASES,
     SemanticCatalog,
     contains_pronoun_reference,
 )
@@ -147,6 +149,59 @@ def _fallback(candidates: dict[str, object], reason: str) -> RuleDecision:
     return RuleDecision(None, candidates, reason)
 
 
+def _focus_metric_for_rank(
+    question: str,
+    metrics: tuple[str, ...],
+    catalog: SemanticCatalog,
+) -> tuple[str, ...]:
+    """Prefer the metric nearest a singular rank request over background metrics."""
+    if len(metrics) <= 1 or not re.search(
+        r"第几|排名如何|排名上|最高|最低|前[一二三\d]|后[一二三\d]", question
+    ):
+        return metrics
+    if re.search(r"各自|分别", question):
+        return metrics
+    rank_position = max(
+        (
+            position
+            for token in ("第几", "排名如何", "排名上", "最高", "最低", "前三", "后三")
+            if (position := question.rfind(token)) >= 0
+        ),
+        default=len(question),
+    )
+    candidates: list[tuple[int, str]] = []
+    for metric_id in metrics:
+        aliases = (catalog.metrics[metric_id].name,)
+        positions = [question.rfind(alias, 0, rank_position) for alias in aliases]
+        position = max(positions, default=-1)
+        if position >= 0:
+            candidates.append((position, metric_id))
+    return (max(candidates)[1],) if candidates else metrics
+
+
+def _focus_metric_for_threshold(
+    question: str,
+    metrics: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Bind a single threshold to the metric mentioned nearest before it."""
+    threshold_match = re.search(
+        r"(?:超过|高于|大于|不低于|至少|低于|小于|不超过|至多|达到)\d+(?:\.\d+)?%?",
+        question,
+    )
+    if not threshold_match:
+        return metrics
+    candidates: list[tuple[int, str]] = []
+    for metric_id in metrics:
+        positions = [
+            question.rfind(alias, 0, threshold_match.start())
+            for alias in METRIC_ALIASES.get(metric_id, ())
+        ]
+        position = max(positions, default=-1)
+        if position >= 0:
+            candidates.append((position, metric_id))
+    return (max(candidates)[1],) if candidates else metrics
+
+
 class RulePlanner:
     """Recognize only reusable query primitives with deterministic semantics."""
 
@@ -155,9 +210,18 @@ class RulePlanner:
 
     def plan(self, raw_question: str, state: SessionState) -> RuleDecision:
         question = normalize_question(raw_question)
-        has_reference = contains_pronoun_reference(question)
-
+        pronoun_reference = contains_pronoun_reference(question)
         explicit_orgs = self.catalog.resolve_organizations(question)
+        population_intent = bool(
+            re.search(r"哪家|哪些|多少家|有几家|前\d|后\d|前三|后三|最高的?[一二三\d]|最低的?[一二三\d]", question)
+        )
+        contextual_continuation = bool(
+            state.last_date
+            and not population_intent
+            and (not explicit_orgs or explicit_orgs == state.last_organizations)
+        )
+        has_reference = pronoun_reference or contextual_continuation
+
         organizations = explicit_orgs
         inherited_orgs = False
         if not organizations and has_reference:
@@ -174,7 +238,10 @@ class RulePlanner:
         is_performance_profile = bool(
             re.search(r"表现较好.*(?:表现)?较差|哪些表现较好.*哪些表现较差", question)
         ) and "主要经营指标" not in question
-        metrics = explicit_metrics
+        is_risk_profile = bool(
+            re.search(r"整体(?:风控|风险)画像|(?:风控|风险)表现最优|综合来看.*(?:风控|风险)", question)
+        )
+        metrics = _focus_metric_for_rank(question, explicit_metrics, self.catalog)
         if composition_formula:
             definition = COMPOSITION_METRICS[composition_formula]
             metrics = (*definition["components"], str(definition["denominator"]))
@@ -191,20 +258,44 @@ class RulePlanner:
             metrics = MAJOR_OPERATING_METRICS
         elif is_performance_profile and not metrics:
             metrics = PERFORMANCE_PROFILE_METRICS
+        elif is_risk_profile:
+            metrics = RISK_PROFILE_METRICS
         elif not metrics and has_reference:
             metrics = state.last_metrics
 
-        current_date = resolve_date(question) or (state.last_date if has_reference else None)
+        current_date = resolve_date(question, state.last_date) or (state.last_date if has_reference else None)
         comparison_value = comparison_kind = None
         if current_date:
-            comparison_value, comparison_kind = comparison_date(question, current_date)
+            comparison_value, comparison_kind = comparison_date(question, current_date, state.last_date)
+        if (
+            not comparison_value
+            and state.last_comparison_date
+            and re.search(r"这个增量|同期变化", question)
+        ):
+            comparison_value = state.last_comparison_date
+            comparison_kind = "inherited_comparison_period"
         start_date, end_date = _period_range(question)
         top_n = _top_n(question)
         threshold = _threshold(question)
+        if (
+            threshold
+            and len(metrics) > 1
+            and not is_risk_profile
+            and len(re.findall(r"\d+(?:\.\d+)?%", question)) <= 1
+        ):
+            metrics = _focus_metric_for_threshold(question, metrics)
         joint_average_filters = _joint_province_average_filters(question, self.catalog)
-        all_scope = bool(
-            re.search(r"全省|13家|哪家|哪些|多少家|排名|前\d|后\d|前三|后三|靠前|靠后|最高|最低|最多|最少", question)
-        ) and not explicit_orgs
+        asks_population = bool(
+            re.search(r"哪家|哪些|多少家|前\d|后\d|前三|后三|靠前|靠后|最高的?[三二一\d]|最低的?[三二一\d]", question)
+        )
+        asks_selected_rank = bool(organizations) and bool(
+            re.search(r"第几|排名如何|排名中|排名上", question)
+        )
+        all_scope = asks_population or (
+            bool(re.search(r"全省|13家", question))
+            and not organizations
+            and not asks_selected_rank
+        )
         organization_scope = "all" if all_scope else "selected"
 
         candidates: dict[str, object] = {
@@ -250,7 +341,9 @@ class RulePlanner:
         limit = None
         rule_id = "point_query_v1"
 
-        is_trend = bool(re.search(r"逐季|季度变化|趋势", question))
+        is_trend = bool(
+            re.search(r"逐季(?:是|变|列|展示|情况|数据|多少)|按季|季度(?:序列|趋势|变化)|趋势", question)
+        )
         is_daily_average = "日均" in question
         asks_extrema = bool(
             re.search(r"最高日|最低日|单日最高|单日最低|哪个季度.*(?:最高|最低)|最高.*最低|最低.*最高", question)
@@ -260,7 +353,7 @@ class RulePlanner:
         asks_count = bool(re.search(r"多少家|有几家|多少天", question))
         asks_sum = bool(re.search(r"合计|总额|加起来|相加|总和", question))
         asks_difference = bool(
-            re.search(r"差多少|相差|多多少|少多少|高多少|低多少|比.*(?:多|少|高|低).*多少", question)
+            re.search(r"差多少|相差|多多少|少多少|高多少|低多少|回落.*多少|减少.*多少|比.*(?:多|少|高|低).*多少", question)
         )
         asks_mean_rank_extremes = bool(
             start_date and end_date and re.search(r"均值|平均", question)
@@ -269,22 +362,32 @@ class RulePlanner:
         asks_arithmetic = bool(
             re.search(r"合计|总额|加起来|相加|分别占|占比|比例|比重|差额|差多少|多多少|高多少|低多少", question)
         )
-        asks_profile = bool(re.search(r"评估|综合|盈利能力|主要经营指标|表现较好|表现较差|三个维度|三方面", question))
+        asks_profile = bool(
+            re.search(
+                r"评估|综合|画像|一句话总结|风控如何|盈利能力|主要经营指标|"
+                r"表现较好|表现较差|最优的?之一|三个维度|三方面",
+                question,
+            )
+        )
         asks_reconciliation = bool(
             re.search(r"(?:是否|是不是)?等于|差额", question)
             and {"ZB001", "ZB003", "ZB004"}.issubset(metrics)
         )
 
-        if is_profitability_profile:
+        if is_risk_profile:
+            query_type, operation, expected_shape, rule_id = (
+                "risk_profile", "profile", "multi_row", "risk_profile_v1"
+            )
+        elif is_profitability_profile:
             query_type, operation, expected_shape, rule_id = (
                 "profitability_profile", "profile", "multi_row", "profitability_profile_v1"
             )
-            comparison_value = comparison_value or "2024-12-31"
+            comparison_value = comparison_value or year_beginning(current_date)
         elif is_major_operating_profile:
             query_type, operation, expected_shape, rule_id = (
                 "major_operating_profile", "profile", "multi_row", "major_operating_profile_v1"
             )
-            comparison_value = "2024-12-31"
+            comparison_value = year_beginning(current_date)
         elif is_three_dimension_profile:
             query_type, operation, expected_shape, rule_id = (
                 "three_dimension_profile", "three_dimension_profile", "multi_row", "three_dimension_profile_v1"
@@ -297,7 +400,9 @@ class RulePlanner:
             query_type, operation, expected_shape, rule_id = (
                 "multi_rank", "multi_rank", "multi_row", "multi_rank_v1"
             )
-        elif asks_profile:
+        elif asks_profile and not (
+            comparison_value or derived_formula or threshold or re.search(r"排名|第几", question)
+        ):
             return _fallback(candidates, "综合评价需要业务语义组合，交由LLM规划")
         elif asks_joint_condition:
             if (
@@ -353,6 +458,8 @@ class RulePlanner:
             query_type, operation, expected_shape, rule_id = (
                 "metric_reconciliation", "reconcile", "single_row", "reconcile_v1"
             )
+        elif derived_formula and asks_difference and start_date and end_date:
+            return _fallback(candidates, "复合期间差值与派生比率交由LLM规划")
         elif derived_formula:
             if len(organizations) != 1:
                 return _fallback(candidates, "跨机构派生指标查询交由LLM规划")
@@ -370,7 +477,11 @@ class RulePlanner:
                 )
                 expected_shape = "single_row" if len(organizations) == 1 and len(metrics) == 1 else "multi_row"
         elif comparison_value:
-            if len(metrics) != 1:
+            if re.search(r"排名变化", question) and organization_scope == "selected":
+                query_type, operation, expected_shape, rule_id = (
+                    "metric_rank_change", "multi_rank_change", "multi_row", "metric_rank_change_v1"
+                )
+            elif len(metrics) != 1:
                 if "排名" in question and re.search(r"变化|变动|怎么变", question):
                     query_type, operation, expected_shape, rule_id = (
                         "multi_rank_change", "multi_rank_change", "multi_row", "multi_rank_change_v1"
@@ -385,12 +496,12 @@ class RulePlanner:
                 query_type, operation, expected_shape, rule_id = (
                     "mom_yoy", "mom_yoy", "single_row", "mom_yoy_v1"
                 )
-            elif top_n or "排名" in question:
+            elif top_n or re.search(r"排名|排第几|位列第几", question):
                 query_type, operation, expected_shape, rule_id = (
                     "period_change_rank", "period_change_rank", "multi_row", "period_change_rank_v1"
                 )
                 sort_direction = "desc"
-                limit = top_n or 3
+                limit = top_n or (None if organization_scope == "selected" else 3)
             elif re.search(r"增幅|增长率|百分之多少", question):
                 if metrics[0] in RATIO_METRICS:
                     return _fallback(candidates, "比率指标应计算百分点差，交由LLM确认语义")
@@ -400,7 +511,12 @@ class RulePlanner:
         elif threshold:
             if len(metrics) != 1:
                 return _fallback(candidates, "多指标阈值条件交由LLM规划")
-            query_type, operation, rule_id = "threshold", "threshold", "threshold_v1"
+            if asks_count:
+                query_type, operation, expected_shape, rule_id = (
+                    "threshold_count", "count_condition", "single_row", "threshold_count_v1"
+                )
+            else:
+                query_type, operation, rule_id = "threshold", "threshold", "threshold_v1"
         elif (
             len(organizations) == 2
             and len(metrics) == 1
@@ -423,19 +539,13 @@ class RulePlanner:
             query_type, operation, expected_shape, rule_id = (
                 "multi_rank", "multi_rank", "multi_row", "multi_rank_v1"
             )
-        elif top_n or re.search(r"排名|排第几|谁.*(?:多|高|低)|最高|最低|最好|最差|靠前|靠后", question):
+        elif top_n or re.search(r"第几|排名|排第几|谁.*(?:多|高|低)|最高|最低|最好|最差|靠前|靠后", question):
             if len(metrics) != 1:
                 return _fallback(candidates, "多指标排名交由LLM规划")
             query_type, operation, rule_id = "ranking", "rank", "ranking_v1"
             metric = self.catalog.metrics[metrics[0]]
             sort_direction = metric.sort_direction
-            if re.search(r"最高|最多|最大", question):
-                sort_direction = "desc"
-            if re.search(r"最低|最少", question):
-                sort_direction = "asc"
-            if "最后" in question or re.search(r"排名后|后三|表现较差|最差|靠后", question):
-                sort_direction = "desc" if metric.sort_direction == "asc" else "asc"
-            limit = top_n or (None if "第几" in question else 1)
+            limit = top_n or (None if organization_scope == "selected" else 1)
             expected_shape = "multi_row" if organization_scope == "all" else (
                 "single_row" if limit == 1 else "multi_row"
             )
@@ -489,10 +599,22 @@ class RulePlanner:
                         "profitability_profile" if is_profitability_profile else None,
                         "major_operating_profile" if is_major_operating_profile else None,
                         "performance_profile" if is_performance_profile else None,
+                        "performance_profile" if is_risk_profile else None,
+                        "risk_profile" if is_risk_profile else None,
                         "rank_population_all" if "第几" in question and organization_scope == "selected" else None,
+                        "rank_population_all" if operation == "rank" and organization_scope == "selected" else None,
                         "rank_population_all" if operation == "multi_rank" else None,
                         "rank_population_all" if operation == "multi_rank_change" else None,
                         "rank_decrease" if operation == "period_change_rank" and "下降" in question else None,
+                        "rank_absolute_change" if operation == "period_change_rank" and "增量" in question else None,
+                        "select_highest_value" if operation == "rank" and re.search(r"最高|最多|最大", question) else None,
+                        "select_lowest_value" if operation == "rank" and re.search(r"最低|最少", question) else None,
+                        "select_bottom_rank" if operation == "rank" and (
+                            "最后" in question or re.search(r"排名后|后三|表现较差|最差|靠后", question)
+                        ) else None,
+                        "needs_summary" if asks_profile else None,
+                        "regulatory_check" if "达标" in question or "监管" in question else None,
+                        "require_organization_count" if asks_count and operation == "multi_metric_province_compare" else None,
                     ),
                 )
             ),

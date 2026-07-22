@@ -8,12 +8,19 @@ import re
 
 import duckdb
 
+from .business_rules import (
+    AUTHORITATIVE_DERIVED_RULE_MAP,
+    LOWER_IS_BETTER,
+    PROVINCE_ORGANIZATION_COUNT,
+    RATIO_METRICS,
+    derived_rule_prompt,
+)
+from .errors import DataBuildError
 
-LOWER_IS_BETTER = {"ZB012", "ZB013", "ZB017"}
-RATIO_METRICS = {"ZB012", "ZB013", "ZB015", "ZB016", "ZB017"}
 APPROVED_TABLES = {"organizations", "metrics", "derived_rules", "metric_values"}
 PROFITABILITY_METRICS = ("ZB011", "ZB012", "ZB008", "ZB007")
 PERFORMANCE_PROFILE_METRICS = ("ZB013", "ZB015", "ZB016", "ZB011", "ZB012")
+RISK_PROFILE_METRICS = ("ZB013", "ZB015", "ZB016")
 THREE_DIMENSION_METRICS = ("ZB001", "ZB002", "ZB013", "ZB011")
 MAJOR_OPERATING_METRICS = (
     "ZB001", "ZB002", "ZB013", "ZB015", "ZB016", "ZB017", "ZB011", "ZB012"
@@ -86,6 +93,12 @@ DERIVED_METRICS: dict[str, dict[str, str | tuple[str, ...]]] = {
         "aliases": ("不良贷款余额占贷款总额", "不良余额占贷款", "按余额计算的不良贷款占比", "不良贷款按余额占比"),
         "numerator": "ZB014", "denominator": "ZB002", "unit": "%"
     },
+    "profit_deposit_ratio": {
+        "aliases": ("净利润/存款比", "净利润与存款比", "净利润存款比"),
+        "numerator": "ZB011",
+        "denominator": "ZB001",
+        "unit": "%",
+    },
     "deposit_per_branch": {
         "aliases": ("网点平均存款规模", "平均存款规模（万元/网点）", "平均存款规模(万元/网点)"),
         "numerator": "ZB001", "denominator": "ZB019", "unit": "万元/网点"
@@ -130,8 +143,47 @@ class SemanticCatalog:
                     "SELECT rule_name, description FROM derived_rules ORDER BY rule_name"
                 ).fetchall()
             }
+            population_bounds = connection.execute(
+                """
+                SELECT MIN(organization_count), MAX(organization_count)
+                FROM (
+                    SELECT data_date, metric_id, COUNT(DISTINCT org_id) AS organization_count
+                    FROM metric_values
+                    GROUP BY data_date, metric_id
+                ) AS metric_populations
+                """
+            ).fetchone()
+            self.metric_population_bounds = population_bounds or (None, None)
         finally:
             connection.close()
+        self._validate_business_contract()
+
+    def _validate_business_contract(self) -> None:
+        """Fail closed if the normalized database drifts from the workbook contract."""
+        if self.rules != AUTHORITATIVE_DERIVED_RULE_MAP:
+            missing = sorted(set(AUTHORITATIVE_DERIVED_RULE_MAP) - set(self.rules))
+            extra = sorted(set(self.rules) - set(AUTHORITATIVE_DERIVED_RULE_MAP))
+            changed = sorted(
+                name
+                for name in set(self.rules) & set(AUTHORITATIVE_DERIVED_RULE_MAP)
+                if self.rules[name] != AUTHORITATIVE_DERIVED_RULE_MAP[name]
+            )
+            details = f"缺失={missing}，多余={extra}，内容不一致={changed}"
+            raise DataBuildError(f"衍生维度说明与系统业务契约不一致：{details}")
+        if len(self.organizations) != PROVINCE_ORGANIZATION_COUNT:
+            raise DataBuildError(
+                "全省均值要求包含"
+                f"{PROVINCE_ORGANIZATION_COUNT}家机构，当前机构表为{len(self.organizations)}家"
+            )
+        if self.metric_population_bounds != (
+            PROVINCE_ORGANIZATION_COUNT,
+            PROVINCE_ORGANIZATION_COUNT,
+        ):
+            raise DataBuildError(
+                "全省均值要求每个日期和指标均包含"
+                f"{PROVINCE_ORGANIZATION_COUNT}家机构，当前最小/最大覆盖数为"
+                f"{self.metric_population_bounds}"
+            )
 
     def resolve_organizations(self, question: str) -> tuple[str, ...]:
         found: list[tuple[int, str]] = []
@@ -208,6 +260,7 @@ class SemanticCatalog:
         ]
         org_matches = self.resolve_organizations(question)
         org_lines = [f"- {org_id}: {self.organizations[org_id]}" for org_id in (org_matches or tuple(self.organizations))]
+        rule_lines = derived_rule_prompt(self.rules).splitlines()
         return "\n".join(
             [
                 "只读表：",
@@ -218,11 +271,17 @@ class SemanticCatalog:
                 *metric_lines,
                 "机构：",
                 *org_lines,
-                "规则：不良贷款率、逾期贷款率、成本收入比越低越好；其他指标默认越高越好。",
-                "较年初基准为2024-12-31；比率指标不计算增幅，使用百分点差。",
+                "衍生维度说明（业务契约，必须逐条遵守）：",
+                *rule_lines,
             ]
         )[:12_000]
 
 
 def contains_pronoun_reference(question: str) -> bool:
-    return bool(re.search(r"它们|这些机构|这几家|上述机构|他们|它的|其", question))
+    return bool(
+        re.search(
+            r"它们|这些机构|这几家|上述机构|他们|它的|其|这个|对应|同期|"
+            r"那|前面|一开始|回到|又|继续|整体|综合来看|如何|怎么样|呢",
+            question,
+        )
+    )
