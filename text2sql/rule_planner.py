@@ -14,8 +14,13 @@ import re
 from .date_resolver import comparison_date, resolve_date
 from .models import PlanFilter, QueryPlan, SessionState
 from .semantic_catalog import (
+    COMPOSITION_METRICS,
     DERIVED_METRICS,
+    PERFORMANCE_PROFILE_METRICS,
+    PROFITABILITY_METRICS,
     RATIO_METRICS,
+    THREE_DIMENSION_METRICS,
+    MAJOR_OPERATING_METRICS,
     SemanticCatalog,
     contains_pronoun_reference,
 )
@@ -33,7 +38,7 @@ def normalize_question(question: str) -> str:
 
 
 def _top_n(question: str) -> int | None:
-    match = re.search(r"(?:前|后|最高的?|最低的?|排名前|排名后)(\d+)(?:家|名|个)?", question)
+    match = re.search(r"(?:前|后|靠前|靠后|最高的?|最低的?|排名前|排名后)(\d+)(?:家|名|个)?", question)
     if match:
         return int(match.group(1))
     chinese = {
@@ -43,9 +48,18 @@ def _top_n(question: str) -> int | None:
     match = re.search(r"(?:前|后)([一二三四五六七八九十])", question)
     if match:
         return chinese[match.group(1)]
+    match = re.search(r"(?:靠前|靠后|最好的?|相对靠后的?)(?:的)?([一二三四五六七八九十])家", question)
+    if match:
+        return chinese[match.group(1)]
     match = re.search(r"(?:最大|最小|最高|最低)的?([一二三四五六七八九十])家", question)
     if match:
         return chinese[match.group(1)]
+    match = re.search(r"(?:最后|最末|倒数)的?([一二三四五六七八九十])家", question)
+    if match:
+        return chinese[match.group(1)]
+    match = re.search(r"(?:最后|最末|倒数)的?(\d+)(?:家|名|个)?", question)
+    if match:
+        return int(match.group(1))
     if re.search(r"哪家|谁.*(?:最高|最低|最多|最少|最好|最差)|排第一|最后一名", question):
         return 1
     return None
@@ -53,19 +67,46 @@ def _top_n(question: str) -> int | None:
 
 def _threshold(question: str) -> PlanFilter | None:
     match = re.search(
-        r"(超过|高于|大于|不低于|至少|低于|小于|不超过|至多)(\d+(?:\.\d+)?)%?",
+        r"(超过|高于|大于|不低于|至少|低于|小于|不超过|至多|达到)(\d+(?:\.\d+)?)%?",
         question,
     )
     if not match:
-        match = re.search(r"(?:满足|达到)(\d+(?:\.\d+)?)%?的?(?:最低)?要求", question)
+        controlled = re.search(r"控制在(\d+(?:\.\d+)?)%?以内", question)
+        if controlled:
+            return PlanFilter("metric_value", "<=", float(controlled.group(1)))
+        match = re.search(r"(?:满足|达到)(\d+(?:\.\d+)?)%?的?(?:最低|监管)?要求", question)
         if not match:
             return None
         return PlanFilter("metric_value", ">=", float(match.group(1)))
     operator = {
         "超过": ">", "高于": ">", "大于": ">", "不低于": ">=", "至少": ">=",
-        "低于": "<", "小于": "<", "不超过": "<=", "至多": "<=",
+        "低于": "<", "小于": "<", "不超过": "<=", "至多": "<=", "达到": ">=",
     }[match.group(1)]
     return PlanFilter("metric_value", operator, float(match.group(2)))
+
+
+def _joint_province_average_filters(
+    question: str,
+    catalog: SemanticCatalog,
+) -> tuple[PlanFilter, ...]:
+    """Resolve reusable per-metric predicates such as ``A低于省均值且B高于省均值``."""
+    operators = {
+        "低于": "<", "小于": "<", "不超过": "<=",
+        "高于": ">", "超过": ">", "大于": ">", "不低于": ">=",
+    }
+    resolved: dict[str, PlanFilter] = {}
+    for clause in re.split(r"(?:同时满足|并且|且|以及)", question):
+        relation = re.search(r"(不低于|不超过|低于|小于|高于|超过|大于).*?(?:全省|省)(?:均值|平均)", clause)
+        clause_metrics = catalog.resolve_metrics(clause)
+        if not relation or len(clause_metrics) != 1:
+            continue
+        metric = clause_metrics[0]
+        resolved[metric] = PlanFilter(
+            field=metric,
+            operator=operators[relation.group(1)],
+            reference="province_average",
+        )
+    return tuple(resolved.values())
 
 
 def _period_range(question: str) -> tuple[str | None, str | None]:
@@ -125,10 +166,31 @@ class RulePlanner:
 
         explicit_metrics = self.catalog.resolve_metrics(question)
         derived_formula = self.catalog.resolve_derived_metric(question)
+        composition_formula = self.catalog.resolve_composition(question)
+        sum_metric_group = self.catalog.resolve_sum_metric_group(question)
+        is_profitability_profile = "盈利能力" in question and "收入结构" in question
+        is_three_dimension_profile = all(token in question for token in ("规模", "资产质量", "盈利能力"))
+        is_major_operating_profile = "主要经营指标" in question and "排名" in question
+        is_performance_profile = bool(
+            re.search(r"表现较好.*(?:表现)?较差|哪些表现较好.*哪些表现较差", question)
+        ) and "主要经营指标" not in question
         metrics = explicit_metrics
-        if derived_formula:
+        if composition_formula:
+            definition = COMPOSITION_METRICS[composition_formula]
+            metrics = (*definition["components"], str(definition["denominator"]))
+        elif sum_metric_group:
+            metrics = sum_metric_group
+        elif derived_formula:
             definition = DERIVED_METRICS[derived_formula]
             metrics = (str(definition["numerator"]), str(definition["denominator"]))
+        elif is_profitability_profile:
+            metrics = PROFITABILITY_METRICS
+        elif is_three_dimension_profile:
+            metrics = THREE_DIMENSION_METRICS
+        elif is_major_operating_profile:
+            metrics = MAJOR_OPERATING_METRICS
+        elif is_performance_profile and not metrics:
+            metrics = PERFORMANCE_PROFILE_METRICS
         elif not metrics and has_reference:
             metrics = state.last_metrics
 
@@ -139,8 +201,9 @@ class RulePlanner:
         start_date, end_date = _period_range(question)
         top_n = _top_n(question)
         threshold = _threshold(question)
+        joint_average_filters = _joint_province_average_filters(question, self.catalog)
         all_scope = bool(
-            re.search(r"全省|13家|哪家|哪些|多少家|排名|前\d|后\d|前三|后三|最高|最低|最多|最少", question)
+            re.search(r"全省|13家|哪家|哪些|多少家|排名|前\d|后\d|前三|后三|靠前|靠后|最高|最低|最多|最少", question)
         ) and not explicit_orgs
         organization_scope = "all" if all_scope else "selected"
 
@@ -155,6 +218,7 @@ class RulePlanner:
             "start_date": start_date,
             "end_date": end_date,
             "derived_formula": derived_formula,
+            "composition_formula": composition_formula,
             "top_n": top_n,
             "threshold": (
                 {
@@ -164,6 +228,10 @@ class RulePlanner:
                     "reference": threshold.reference,
                 }
                 if threshold else None
+            ),
+            "joint_average_filters": tuple(
+                {"metric": item.field, "operator": item.operator, "reference": item.reference}
+                for item in joint_average_filters
             ),
         }
 
@@ -184,52 +252,146 @@ class RulePlanner:
 
         is_trend = bool(re.search(r"逐季|季度变化|趋势", question))
         is_daily_average = "日均" in question
-        asks_extrema = bool(re.search(r"最高日|最低日|单日最高|单日最低|哪个季度.*(?:最高|最低)", question))
+        asks_extrema = bool(
+            re.search(r"最高日|最低日|单日最高|单日最低|哪个季度.*(?:最高|最低)|最高.*最低|最低.*最高", question)
+        )
         asks_joint_condition = bool(re.search(r"同时满足|且.*(?:均值|平均)", question))
         asks_province_average = bool(re.search(r"全省(?:均值|平均)|省均值|平均水平", question))
         asks_count = bool(re.search(r"多少家|有几家|多少天", question))
+        asks_sum = bool(re.search(r"合计|总额|加起来|相加|总和", question))
+        asks_difference = bool(
+            re.search(r"差多少|相差|多多少|少多少|高多少|低多少|比.*(?:多|少|高|低).*多少", question)
+        )
+        asks_mean_rank_extremes = bool(
+            start_date and end_date and re.search(r"均值|平均", question)
+            and re.search(r"前(?:三|\d).*(?:后|最后)|后(?:三|\d).*(?:前|最前)", question)
+        )
         asks_arithmetic = bool(
             re.search(r"合计|总额|加起来|相加|分别占|占比|比例|比重|差额|差多少|多多少|高多少|低多少", question)
         )
         asks_profile = bool(re.search(r"评估|综合|盈利能力|主要经营指标|表现较好|表现较差|三个维度|三方面", question))
+        asks_reconciliation = bool(
+            re.search(r"(?:是否|是不是)?等于|差额", question)
+            and {"ZB001", "ZB003", "ZB004"}.issubset(metrics)
+        )
 
-        if asks_profile:
+        if is_profitability_profile:
+            query_type, operation, expected_shape, rule_id = (
+                "profitability_profile", "profile", "multi_row", "profitability_profile_v1"
+            )
+            comparison_value = comparison_value or "2024-12-31"
+        elif is_major_operating_profile:
+            query_type, operation, expected_shape, rule_id = (
+                "major_operating_profile", "profile", "multi_row", "major_operating_profile_v1"
+            )
+            comparison_value = "2024-12-31"
+        elif is_three_dimension_profile:
+            query_type, operation, expected_shape, rule_id = (
+                "three_dimension_profile", "three_dimension_profile", "multi_row", "three_dimension_profile_v1"
+            )
+        elif is_performance_profile:
+            query_type, operation, expected_shape, rule_id = (
+                "performance_profile", "profile", "multi_row", "performance_profile_v1"
+            )
+        elif asks_profile and len(metrics) > 1 and "排名" in question:
+            query_type, operation, expected_shape, rule_id = (
+                "multi_rank", "multi_rank", "multi_row", "multi_rank_v1"
+            )
+        elif asks_profile:
             return _fallback(candidates, "综合评价需要业务语义组合，交由LLM规划")
-        if asks_joint_condition:
-            return _fallback(candidates, "多指标联合条件需要组合聚合，交由LLM规划")
-        if is_trend:
-            if len(metrics) != 1 or not (start_date and end_date) or asks_extrema:
+        elif asks_joint_condition:
+            if (
+                asks_province_average
+                and len(metrics) >= 2
+                and {item.field for item in joint_average_filters} == set(metrics)
+            ):
+                filters = joint_average_filters
+                query_type, operation, expected_shape, rule_id = (
+                    "joint_province_average", "multi_metric_province_compare", "multi_row",
+                    "multi_metric_province_compare_v1",
+                )
+            else:
+                return _fallback(candidates, "多指标联合条件未能完整绑定指标与比较方向，交由LLM规划")
+        elif is_trend:
+            if len(metrics) != 1 or not (start_date and end_date):
                 return _fallback(candidates, "复合趋势分析交由LLM规划")
             query_type, operation, expected_shape, rule_id = (
                 "trend", "quarterly_trend", "time_series", "trend_v1"
             )
             current_date = end_date
+        elif asks_mean_rank_extremes and len(metrics) == 1 and organization_scope == "all":
+            query_type, operation, expected_shape, rule_id = (
+                "period_rank_extremes", "period_rank_extremes", "multi_row", "period_rank_extremes_v1"
+            )
+            sort_direction = self.catalog.metrics[metrics[0]].sort_direction
+            limit = top_n or 3
+        elif asks_extrema and start_date and end_date and organization_scope == "all":
+            query_type, operation, expected_shape, rule_id = (
+                "period_extrema", "period_extrema", "multi_row", "period_extrema_v1"
+            )
         elif is_daily_average:
-            if len(metrics) != 1 or not (start_date and end_date) or asks_extrema or asks_count:
+            if len(metrics) != 1 or not (start_date and end_date) or asks_count:
                 return _fallback(candidates, "复合期间统计交由LLM规划")
             query_type, operation, rule_id = "period_average", "daily_average", "period_average_v1"
             current_date = end_date
+        elif (
+            start_date and end_date and len(metrics) == 1 and len(organizations) == 1
+            and asks_count and asks_province_average
+        ):
+            average_operator = ">" if re.search(r"高于|超过|大于", question) else "<"
+            filters = (PlanFilter("metric_value", average_operator, reference="province_average"),)
+            query_type, operation, expected_shape, rule_id = (
+                "period_count_vs_average", "count_vs_average", "single_row", "count_vs_average_v1"
+            )
         elif start_date and end_date and not current_date:
             return _fallback(candidates, "区间聚合语义超出基础规则，交由LLM规划")
+        elif composition_formula:
+            query_type, operation, expected_shape, rule_id = (
+                "composition", "composition", "multi_row", "composition_v1"
+            )
+        elif asks_reconciliation:
+            query_type, operation, expected_shape, rule_id = (
+                "metric_reconciliation", "reconcile", "single_row", "reconcile_v1"
+            )
         elif derived_formula:
             if len(organizations) != 1:
                 return _fallback(candidates, "跨机构派生指标查询交由LLM规划")
             query_type, operation, rule_id = "derived_ratio", "ratio", "derived_ratio_v1"
         elif asks_province_average:
-            if asks_count or asks_arithmetic:
-                return _fallback(candidates, "全省均值计数或复合比较交由LLM规划")
-            query_type, operation, rule_id = (
-                "province_average_comparison", "province_average_compare", "province_average_v1"
-            )
-            expected_shape = "single_row" if len(organizations) == 1 and len(metrics) == 1 else "multi_row"
+            if asks_count:
+                average_operator = ">" if re.search(r"高于|超过|大于", question) else "<"
+                filters = (PlanFilter("metric_value", average_operator, reference="province_average"),)
+                query_type, operation, expected_shape, rule_id = (
+                    "point_count_vs_average", "count_vs_average", "single_row", "count_vs_average_v1"
+                )
+            else:
+                query_type, operation, rule_id = (
+                    "province_average_comparison", "province_average_compare", "province_average_v1"
+                )
+                expected_shape = "single_row" if len(organizations) == 1 and len(metrics) == 1 else "multi_row"
         elif comparison_value:
             if len(metrics) != 1:
-                return _fallback(candidates, "多指标期间比较交由LLM规划")
-            if "环比" in question and "同比" in question:
-                return _fallback(candidates, "环比与同比联合计算交由LLM规划")
-            if top_n or "排名" in question:
-                return _fallback(candidates, "期间变化排名交由LLM规划")
-            if re.search(r"增幅|增长率|百分之多少", question):
+                if "排名" in question and re.search(r"变化|变动|怎么变", question):
+                    query_type, operation, expected_shape, rule_id = (
+                        "multi_rank_change", "multi_rank_change", "multi_row", "multi_rank_change_v1"
+                    )
+                elif re.search(r"变动方向|分别.*(?:上升|下降)|方向", question):
+                    query_type, operation, expected_shape, rule_id = (
+                        "multi_period_change", "multi_period_change", "multi_row", "multi_period_change_v1"
+                    )
+                else:
+                    return _fallback(candidates, "多指标期间比较交由LLM规划")
+            elif "环比" in question and "同比" in question:
+                query_type, operation, expected_shape, rule_id = (
+                    "mom_yoy", "mom_yoy", "single_row", "mom_yoy_v1"
+                )
+            elif top_n or "排名" in question:
+                query_type, operation, expected_shape, rule_id = (
+                    "period_change_rank", "period_change_rank", "multi_row", "period_change_rank_v1"
+                )
+                sort_direction = "desc"
+                limit = top_n or 3
+            elif re.search(r"增幅|增长率|百分之多少", question):
                 if metrics[0] in RATIO_METRICS:
                     return _fallback(candidates, "比率指标应计算百分点差，交由LLM确认语义")
                 query_type, operation, rule_id = "period_growth", "growth", "period_growth_v1"
@@ -239,7 +401,29 @@ class RulePlanner:
             if len(metrics) != 1:
                 return _fallback(candidates, "多指标阈值条件交由LLM规划")
             query_type, operation, rule_id = "threshold", "threshold", "threshold_v1"
-        elif top_n or re.search(r"排名|排第几|谁.*(?:多|高|低)|最高|最低|最好|最差", question):
+        elif (
+            len(organizations) == 2
+            and len(metrics) == 1
+            and asks_arithmetic
+            and re.search(r"谁.*(?:更高|更多|更低|更少)", question)
+        ):
+            query_type, operation, expected_shape, rule_id = (
+                "pairwise_difference", "value", "multi_row", "pairwise_difference_v1"
+            )
+        elif asks_difference and (
+            (len(organizations) == 2 and len(metrics) == 1)
+            or (len(organizations) == 1 and len(metrics) == 2)
+        ):
+            query_type, operation, expected_shape, rule_id = (
+                "cross_difference", "cross_difference", "multi_row", "cross_difference_v1"
+            )
+        elif (
+            len(metrics) > 1 and "排名" in question and organization_scope == "selected"
+        ):
+            query_type, operation, expected_shape, rule_id = (
+                "multi_rank", "multi_rank", "multi_row", "multi_rank_v1"
+            )
+        elif top_n or re.search(r"排名|排第几|谁.*(?:多|高|低)|最高|最低|最好|最差|靠前|靠后", question):
             if len(metrics) != 1:
                 return _fallback(candidates, "多指标排名交由LLM规划")
             query_type, operation, rule_id = "ranking", "rank", "ranking_v1"
@@ -249,10 +433,18 @@ class RulePlanner:
                 sort_direction = "desc"
             if re.search(r"最低|最少", question):
                 sort_direction = "asc"
-            if "最后" in question or re.search(r"排名后|后三|表现较差|最差", question):
+            if "最后" in question or re.search(r"排名后|后三|表现较差|最差|靠后", question):
                 sort_direction = "desc" if metric.sort_direction == "asc" else "asc"
             limit = top_n or (None if "第几" in question else 1)
-            expected_shape = "single_row" if limit == 1 else "multi_row"
+            expected_shape = "multi_row" if organization_scope == "all" else (
+                "single_row" if limit == 1 else "multi_row"
+            )
+        elif asks_sum and (
+            len(metrics) > 1 or len(organizations) > 1
+        ) and len({self.catalog.metrics[metric].unit for metric in metrics}) == 1:
+            query_type, operation, expected_shape, rule_id = (
+                "multi_metric_sum", "sum", "multi_row", "sum_v1"
+            )
         elif asks_arithmetic:
             return _fallback(candidates, "跨指标或跨机构计算交由LLM规划")
 
@@ -260,7 +452,10 @@ class RulePlanner:
             expected_shape = "multi_row"
             rule_id = "multi_metric_point_v1"
 
-        if operation not in {"daily_average", "quarterly_trend"}:
+        if operation not in {
+            "daily_average", "quarterly_trend", "count_vs_average",
+            "period_rank_extremes", "period_extrema",
+        }:
             start_date = end_date = None
         plan = QueryPlan(
             source="rule",
@@ -286,7 +481,18 @@ class RulePlanner:
                     None,
                     (
                         comparison_kind,
+                        "pairwise_difference" if query_type == "pairwise_difference" else None,
+                        "pairwise_lower" if query_type == "pairwise_difference" and re.search(r"更低|更少", question) else None,
+                        "include_extrema" if is_trend and asks_extrema else None,
+                        "include_extrema" if is_daily_average and asks_extrema else None,
+                        composition_formula,
+                        "profitability_profile" if is_profitability_profile else None,
+                        "major_operating_profile" if is_major_operating_profile else None,
+                        "performance_profile" if is_performance_profile else None,
                         "rank_population_all" if "第几" in question and organization_scope == "selected" else None,
+                        "rank_population_all" if operation == "multi_rank" else None,
+                        "rank_population_all" if operation == "multi_rank_change" else None,
+                        "rank_decrease" if operation == "period_change_rank" and "下降" in question else None,
                     ),
                 )
             ),

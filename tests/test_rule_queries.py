@@ -22,6 +22,13 @@ def test_lower_is_better_ranking(service):
     assert "ORDER BY v.metric_value ASC" in response.plan["sql"]
 
 
+def test_top_one_keeps_all_tied_organizations(service):
+    response = service.ask("2026年4月15日，全省13家农商行里逾期贷款率最高的是哪家？", "rank-tie")
+    assert response.route == "rule"
+    assert [row[1] for row in response.rows] == ["江苏省D市农商行", "江苏省I市农商行"]
+    assert all(row[-1] == 1 for row in response.rows)
+
+
 def test_period_difference(service):
     response = service.ask(
         "江苏省A市农商行的各项存款余额截至2025-03-31，和2024年末相比变化了多少？",
@@ -136,18 +143,320 @@ def test_simple_quarterly_series_uses_rule_path(service):
     assert len(response.rows) == 5
 
 
+def test_quarterly_series_can_summarize_extrema_without_llm(service):
+    response = service.ask(
+        "请分析江苏省A市农商行的各项存款余额从2025年一季度末到2026年一季度末的逐季变化，最高和最低分别在哪个季度？",
+        "quarter-extrema",
+    )
+    assert response.route == "rule"
+    assert "最高为2026-03-31：42.32亿元" in response.answer
+    assert "最低为2025-09-30：41.35亿元" in response.answer
+
+
+def test_pairwise_comparison_answers_both_winner_and_gap(service):
+    response = service.ask(
+        "2025年3月31日，江苏省C市农商行和江苏省H市农商行谁的各项存款余额更高？相差多少？",
+        "pairwise-gap",
+    )
+    assert response.route == "rule"
+    assert "江苏省C市农商行更高" in response.answer
+    assert "两家相差78.03亿元" in response.answer
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("江苏省H市农商行在2025年4月30日的拨备覆盖率是否达到150%的监管要求？", "满足"),
+        ("江苏省A市农商行在2026年4月30日的不良贷款率是否控制在1%以内？", "满足"),
+    ],
+)
+def test_regulatory_threshold_variants_return_a_judgement(service, question, expected):
+    response = service.ask(question, f"threshold-{expected}")
+    assert response.route == "rule"
+    assert expected in response.answer
+
+
+def test_province_average_with_gap_stays_on_generic_average_rule(service):
+    response = service.ask(
+        "江苏省F市农商行2025年2月28日的各项存款余额跟全省平均比是高还是低？差多少？",
+        "average-gap",
+    )
+    assert response.route == "rule"
+    assert "高于全省均值31.8亿元" in response.answer
+
+
+def test_additional_derived_metric_aliases(service):
+    per_employee = service.ask("江苏省K市农商行在2026年3月31日的人均净利润是多少？", "per-employee")
+    npl_share = service.ask("江苏省D市农商行在2026年4月30日的按余额计算的不良贷款占比是多少？", "npl-share")
+    assert per_employee.route == "rule"
+    assert per_employee.answer.endswith("万元/人")
+    assert "101.49万元" not in per_employee.answer
+    assert npl_share.route == "rule"
+    assert npl_share.answer == "江苏省D市农商行：1.6%"
+
+
 @pytest.mark.parametrize(
     "question",
     [
-        "2025年全年不良贷款率均值前3后3是谁？",
-        "江苏省A市农商行和江苏省B市农商行两家加起来，2025年底的存款总额有多少？",
-        "2025年6月末，江苏省C市农商行比江苏省G市农商行的存款多多少？",
+        "截至2025年5月31日，按各项贷款余额看，表现相对靠后的三家分别是谁？",
+        "截至2025年12月31日，按成本收入比看，表现相对靠后的三家分别是谁？",
+        "截至2026年2月28日，按拨备覆盖率看，表现相对靠后的三家分别是谁？",
+        "截至2026年4月30日，按个人客户数看，表现相对靠后的三家分别是谁？",
+    ],
+)
+def test_relative_bottom_three_is_a_basic_rank_primitive(service, question):
+    response = service.ask(question, f"bottom-{hash(question)}")
+    assert response.route == "rule"
+    assert response.plan["operation"] == "rank"
+    assert len(response.rows) == 3
+
+
+def test_last_three_wording_returns_three_rows(service):
+    response = service.ask("截至2025-04-30，不良贷款率排名最后的三家是哪些？", "last-three")
+    assert response.route == "rule"
+    assert [row[1] for row in response.rows] == [
+        "江苏省D市农商行", "江苏省H市农商行", "江苏省I市农商行"
+    ]
+
+
+def test_deposit_composition_is_calculated_from_three_metrics(service):
+    response = service.ask(
         "江苏省B市农商行在2025-06-30的存款中，对公和个人分别占比多少？",
-        "2025年12月31日，有多少家农商行的贷款余额超过了全省平均值？",
-        "江苏省K市农商行从2024年末到2026年4月末，存款、贷款、不良率、净利润的排名分别变化了多少？",
-        "请分析江苏省A市农商行的各项存款余额从2025年一季度末到2026年一季度末的逐季变化，哪个季度最高？",
+        "deposit-composition",
+    )
+    assert response.route == "rule"
+    assert response.answer == "对公存款占比35.52%，个人存款占比64.48%"
+
+
+def test_multi_metric_sum_returns_components_and_total(service):
+    response = service.ask(
+        "江苏省E市农商行2025年底的对公客户数和个人客户数分别是多少？合计多少？",
+        "metric-sum",
+    )
+    assert response.route == "rule"
+    assert "对公客户数1461户" in response.answer
+    assert "个人客户数146477户" in response.answer
+    assert "合计147938户" in response.answer
+
+
+def test_daily_average_with_extrema_is_one_deterministic_query(service):
+    response = service.ask(
+        "江苏省A市农商行2025年全年的各项贷款余额日均值是多少？最高日和最低日分别出现在什么水平？",
+        "daily-statistics",
+    )
+    assert response.route == "rule"
+    assert "日均33.88亿元" in response.answer
+    assert "最高日" in response.answer and "34.58亿元" in response.answer
+    assert "最低日" in response.answer and "32.96亿元" in response.answer
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        (
+            "分析江苏省A市农商行在2026-04-30的各项存款余额环比（较上月）和同比（较去年同期）的变化情况。",
+            ("环比下降1.47%", "同比下降0.83%"),
+        ),
+        (
+            "江苏省K市农商行在2026-04-30的净利润环比和同比分别变动了多少？",
+            ("环比增长20.63%", "同比增长24.51%"),
+        ),
+    ],
+)
+def test_mom_and_yoy_are_calculated_together(service, question, expected):
+    response = service.ask(question, f"mom-yoy-{hash(question)}")
+    assert response.route == "rule"
+    assert all(value in response.answer for value in expected)
+
+
+def test_period_count_vs_province_average_uses_all_orgs_before_filter(service):
+    response = service.ask(
         "2025年全年，江苏省G市农商行的成本收入比有多少天高于全省均值？",
-        "截至2026年一季度末，同时满足存款高于全省平均且不良率低于全省平均的机构有哪些？",
+        "count-vs-average",
+    )
+    assert response.route == "rule"
+    assert response.answer == "江苏省G市农商行：11天高于全省均值（共365天，占比3.01%）"
+
+
+def test_profitability_profile_includes_income_structure(service):
+    response = service.ask(
+        "评估江苏省K市农商行在2026-04-30的盈利能力，包含净利润、成本收入比、收入结构和较年初变化。",
+        "profitability-profile",
+    )
+    assert response.route == "rule"
+    assert "净利息收入51.72万元" in response.answer
+    assert "中间业务收入172.05万元" in response.answer
+    assert "较年初净利润增长21.25万元" in response.answer
+
+
+def test_performance_profile_has_valid_metric_plan(service):
+    response = service.ask(
+        "江苏省D市农商行在2026-01-31的表现较好和较差的指标分别有哪些？",
+        "performance-profile",
+    )
+    assert response.route == "rule"
+    assert "表现较好：无" in response.answer
+    assert "不良贷款率（第13名）" in response.answer
+    assert "净利润（第11名）" in response.answer
+
+    later = service.ask(
+        "江苏省F市农商行在2025-11-30的指标中哪些表现较好？哪些表现较差？",
+        "performance-profile-bottom-four",
+    )
+    assert "表现较差：拨备覆盖率（第10名）" in later.answer
+
+
+def test_joint_metric_province_average_conditions_are_local_and_readable(service):
+    response = service.ask(
+        "2026年3月末，哪些农商行同时满足不良率低于全省均值且拨备覆盖率高于全省均值？",
+        "joint-province-average",
+    )
+    assert response.route == "rule"
+    assert response.plan["operation"] == "multi_metric_province_compare"
+    assert "江苏省A市农商行：不良贷款率0.92%（低于全省均值1.14%）" in response.answer
+    assert "拨备覆盖率202.47%（高于全省均值178.52%）" in response.answer
+    assert response.answer.count("农商行：") == 6
+
+
+def test_multi_metric_values_keep_metric_names(service):
+    response = service.ask(
+        "列出江苏省F市农商行在2026-04-30的风险指标数据，含不良率、拨备覆盖率、逾期率和资本充足率。",
+        "named-risk-values",
+    )
+    assert "不良贷款率：1.35%" in response.answer
+    assert "拨备覆盖率：167.48%" in response.answer
+    assert "资本充足率：11.99%" in response.answer
+    assert "逾期贷款率：1.15%" in response.answer
+
+
+def test_tiny_province_average_gap_is_not_rounded_to_zero(service):
+    response = service.ask(
+        "江苏省M市农商行在2026-04-30的不良率和全省均值比怎么样？",
+        "tiny-average-gap",
+    )
+    assert "低于全省均值0.0031个百分点" in response.answer
+
+
+def test_major_operating_profile_is_local_and_complete(service):
+    response = service.ask(
+        "请列出江苏省G市农商行在2025-11-30的主要经营指标及排名，哪些指标表现较好，哪些表现较差？",
+        "major-profile",
+    )
+    assert response.route == "rule"
+    assert "存贷比81.21%" in response.answer
+    assert "不良贷款率0.96%" in response.answer
+    assert "拨备覆盖率188.94%" in response.answer
+    assert "净利润239.28万元" in response.answer
+    assert "较年初" in response.answer
+
+
+def test_combined_risk_rate_sums_only_the_two_requested_rates(service):
+    response = service.ask(
+        "江苏省M市农商行在2025年12月底的不良+逾期合计占贷款比？",
+        "combined-risk",
+    )
+    assert response.route == "rule"
+    assert "不良贷款率1.21%" in response.answer
+    assert "逾期贷款率1.04%" in response.answer
+    assert "合计2.25%" in response.answer
+
+
+def test_period_mean_front_and_back_ranking_is_deterministic(service):
+    response = service.ask("2025年全年不良贷款率均值前3后3是谁？", "mean-ranks")
+    assert response.route == "rule"
+    assert "前3名：江苏省J市农商行" in response.answer
+    assert "后3名：江苏省H市农商行" in response.answer
+
+
+def test_cross_entity_difference_avoids_llm(service):
+    response = service.ask(
+        "2025年6月末，江苏省C市农商行比江苏省G市农商行的存款多多少？",
+        "cross-difference",
+    )
+    assert response.route == "rule"
+    assert "相差4.72亿元" in response.answer
+
+
+def test_point_count_vs_average_is_local(service):
+    response = service.ask(
+        "2025年12月31日，有多少家农商行的贷款余额超过了全省平均值？",
+        "point-count-average",
+    )
+    assert response.route == "rule"
+    assert "家机构高于全省均值" in response.answer
+    assert "共13家" in response.answer
+
+
+def test_period_global_extrema_is_local(service):
+    response = service.ask(
+        "2025年全年，各项贷款余额的单日最高值出现在哪家？单日最低值在哪家？",
+        "period-extrema",
+    )
+    assert response.route == "rule"
+    assert "最高值：江苏省C市农商行" in response.answer
+    assert "最低值：江苏省H市农商行" in response.answer
+
+
+def test_period_growth_ranking_is_local(service):
+    response = service.ask(
+        "从2024年末到2026-03-31，全省各项存款余额增幅排名前三的是哪几家？增幅各是多少？",
+        "period-growth-rank",
+    )
+    assert response.route == "rule"
+    assert "第1名 江苏省H市农商行：增长2.58%" in response.answer
+    assert len(response.rows) == 3
+
+
+def test_multi_metric_period_direction_is_local(service):
+    response = service.ask(
+        "江苏省A市农商行从2025年上半年末到年末，存款、贷款、不良率和净利润的变动方向分别是什么？",
+        "multi-period-direction",
+    )
+    assert response.route == "rule"
+    assert "各项存款余额上升" in response.answer
+    assert "各项贷款余额下降" in response.answer
+    assert "不良贷款率下降" in response.answer
+
+
+def test_three_dimension_profile_is_local(service):
+    response = service.ask(
+        "从规模、资产质量、盈利能力三个维度，分别列出江苏省L市农商行在2026-04-30的各项指标及排名。",
+        "three-dimension",
+    )
+    assert response.route == "rule"
+    assert "规模：存款88.17亿元（第4名）" in response.answer
+    assert "资产质量：不良贷款率0.85%（第2名）" in response.answer
+    assert "盈利能力：净利润204.66万元（第4名）" in response.answer
+
+
+def test_multi_metric_rank_and_rank_change_are_local(service):
+    snapshot = service.ask(
+        "2025年底，江苏省L市农商行在规模（贷款）、质量（不良率）、效益（净利润）三方面排名各是多少？",
+        "multi-rank",
+    )
+    changes = service.ask(
+        "江苏省K市农商行从2024年末到2026年4月末，存款、贷款、不良率、净利润的排名分别变化了多少？",
+        "multi-rank-change",
+    )
+    assert snapshot.route == "rule"
+    assert "各项贷款余额：71.37亿元，全省第4名" in snapshot.answer
+    assert changes.route == "rule"
+    assert "净利润：第11名→第9名，排名提升2名" in changes.answer
+
+
+def test_component_reconciliation_is_local(service):
+    response = service.ask(
+        "2025年12月末，江苏省C市农商行的对公存款加个人存款是不是等于各项存款？差额多少？",
+        "reconcile",
+    )
+    assert response.route == "rule"
+    assert "等于各项存款" in response.answer
+    assert "差额0亿元" in response.answer
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
         "评估江苏省A市农商行2025年末的盈利能力。",
     ],
 )

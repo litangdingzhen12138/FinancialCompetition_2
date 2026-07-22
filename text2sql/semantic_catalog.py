@@ -12,6 +12,23 @@ import duckdb
 LOWER_IS_BETTER = {"ZB012", "ZB013", "ZB017"}
 RATIO_METRICS = {"ZB012", "ZB013", "ZB015", "ZB016", "ZB017"}
 APPROVED_TABLES = {"organizations", "metrics", "derived_rules", "metric_values"}
+PROFITABILITY_METRICS = ("ZB011", "ZB012", "ZB008", "ZB007")
+PERFORMANCE_PROFILE_METRICS = ("ZB013", "ZB015", "ZB016", "ZB011", "ZB012")
+THREE_DIMENSION_METRICS = ("ZB001", "ZB002", "ZB013", "ZB011")
+MAJOR_OPERATING_METRICS = (
+    "ZB001", "ZB002", "ZB013", "ZB015", "ZB016", "ZB017", "ZB011", "ZB012"
+)
+
+COMPOSITION_METRICS: dict[str, dict[str, str | tuple[str, ...]]] = {
+    "deposit_composition": {
+        "components": ("ZB003", "ZB004"),
+        "denominator": "ZB001",
+    },
+    "loan_composition": {
+        "components": ("ZB005", "ZB006"),
+        "denominator": "ZB002",
+    },
+}
 
 METRIC_ALIASES: dict[str, tuple[str, ...]] = {
     "ZB001": ("各项存款余额", "存款余额", "存款规模", "总存款", "存款"),
@@ -63,10 +80,10 @@ DERIVED_METRICS: dict[str, dict[str, str | tuple[str, ...]]] = {
         "aliases": ("净利息收入占营业收入", "净利息收入比重"), "numerator": "ZB008", "denominator": "ZB009", "unit": "%"
     },
     "profit_per_employee": {
-        "aliases": ("人均利润",), "numerator": "ZB011", "denominator": "ZB018", "unit": "万元/人"
+        "aliases": ("人均利润", "人均净利润"), "numerator": "ZB011", "denominator": "ZB018", "unit": "万元/人"
     },
     "npl_balance_share": {
-        "aliases": ("不良贷款余额占贷款总额", "不良余额占贷款"),
+        "aliases": ("不良贷款余额占贷款总额", "不良余额占贷款", "按余额计算的不良贷款占比", "不良贷款按余额占比"),
         "numerator": "ZB014", "denominator": "ZB002", "unit": "%"
     },
     "deposit_per_branch": {
@@ -155,6 +172,24 @@ class SemanticCatalog:
             if any(alias in question for alias in aliases):
                 return name
         return None
+
+    @staticmethod
+    def resolve_composition(question: str) -> str | None:
+        asks_share = any(token in question for token in ("占比", "比例", "比重"))
+        if asks_share and "对公" in question and "个人" in question:
+            if "存款" in question:
+                return "deposit_composition"
+            if "贷款" in question:
+                return "loan_composition"
+        return None
+
+    @staticmethod
+    def resolve_sum_metric_group(question: str) -> tuple[str, ...]:
+        if "不良" in question and "逾期" in question and (
+            "合计" in question or "相加" in question or "+" in question
+        ):
+            return ("ZB013", "ZB017")
+        return ()
 
     def unit_for_plan(self, metrics: tuple[str, ...], derived_formula: str | None) -> str:
         if derived_formula in DERIVED_METRICS:

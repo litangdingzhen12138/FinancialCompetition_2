@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import re
 import uuid
 
 from .answerer import format_answer
 from .config import Settings
 from .data_builder import ensure_database
-from .errors import ConfigurationError, Text2SQLError, retry_feedback
+from .errors import ConfigurationError, ResultValidationError, Text2SQLError, retry_feedback
 from .executor import DuckDBExecutor
 from .llm_planner import LLMPlanner
 from .models import QueryPlan, QueryResponse, QueryResult, SessionState
 from .rule_planner import RuleDecision, RulePlanner
-from .semantic_catalog import SemanticCatalog
+from .semantic_catalog import LOWER_IS_BETTER, SemanticCatalog
 from .session_store import InMemorySessionStore
-from .sql_compiler import compile_rule_sql
+from .sql_compiler import compile_global_rank_sql, compile_rule_sql
 from .validators import AlignmentValidator, PlanValidator, ResultValidator, SQLGuard
 
 
@@ -68,9 +69,81 @@ class Text2SQLService:
                 }
             )
         self.result_validator.validate(plan, result)
+        self._validate_rank_semantics(plan, result)
         if trace is not None:
             trace.append({"stage": "result_validation", "status": "ok"})
         return approved_sql, result
+
+    @staticmethod
+    def _augment_llm_plan(question: str, plan: QueryPlan) -> QueryPlan:
+        assumptions = list(plan.assumptions)
+        if re.search(r"(?:各自在全省|全省\d*家里).*排第几|排名.*(?:怎么变|变化)", question):
+            assumptions.append("rank_population_all")
+        if "哪些" in question and re.search(r"一共有几家|有几家|多少家", question):
+            assumptions.append("require_organization_list")
+        return replace(plan, assumptions=tuple(dict.fromkeys(assumptions)))
+
+    def _validate_rank_semantics(self, plan: QueryPlan, result: QueryResult) -> None:
+        """Verify selected-organization ranks against the full organization population."""
+        if plan.source != "llm" or "rank_population_all" not in plan.assumptions:
+            return
+        column_map = {name.lower(): index for index, name in enumerate(result.columns)}
+        metric_index = column_map.get("metric_id")
+        org_index = column_map.get("org_id")
+        if metric_index is None:
+            raise ResultValidationError("全省排名结果缺少metric_id，无法验证排名口径")
+        current_rank_index = next(
+            (column_map[name] for name in ("current_rank", "metric_rank", "rank") if name in column_map),
+            None,
+        )
+        comparison_rank_index = next(
+            (column_map[name] for name in ("previous_rank", "comparison_rank", "base_rank") if name in column_map),
+            None,
+        )
+        if current_rank_index is None:
+            raise ResultValidationError("问题要求全省排名，但结果缺少可验证的排名列")
+
+        quoted_metrics = ", ".join(f"'{metric}'" for metric in plan.metrics)
+        lower_metrics = tuple(metric for metric in plan.metrics if metric in LOWER_IS_BETTER)
+        quoted_lower = ", ".join(f"'{metric}'" for metric in lower_metrics) or "''"
+
+        def expected_ranks(data_date: str) -> dict[tuple[str, str], int]:
+            sql = f"""
+                WITH ranked AS (
+                    SELECT org_id, metric_id,
+                           RANK() OVER (
+                               PARTITION BY metric_id
+                               ORDER BY
+                                   CASE WHEN metric_id IN ({quoted_lower}) THEN metric_value END ASC,
+                                   CASE WHEN metric_id NOT IN ({quoted_lower}) THEN metric_value END DESC
+                           ) AS expected_rank
+                    FROM metric_values
+                    WHERE data_date = DATE '{data_date}'
+                      AND metric_id IN ({quoted_metrics})
+                )
+                SELECT org_id, metric_id, expected_rank FROM ranked
+            """
+            oracle = self.executor.execute(sql)
+            return {(str(org), str(metric)): int(rank) for org, metric, rank in oracle.rows}
+
+        def validate_column(data_date: str | None, rank_index: int | None, label: str) -> None:
+            if not data_date or rank_index is None:
+                return
+            oracle = expected_ranks(data_date)
+            for row in result.rows:
+                metric = str(row[metric_index])
+                org = str(row[org_index]) if org_index is not None else (
+                    plan.organizations[0] if len(plan.organizations) == 1 else ""
+                )
+                actual = row[rank_index]
+                expected = oracle.get((org, metric))
+                if expected is None or actual is None or int(actual) != expected:
+                    raise ResultValidationError(
+                        f"{label}排名口径错误：{org}/{metric}返回{actual}，全省排名应为{expected}"
+                    )
+
+        validate_column(plan.current_date, current_rank_index, "当前期")
+        validate_column(plan.comparison_date, comparison_rank_index, "比较期")
 
     def _response(
         self,
@@ -114,6 +187,15 @@ class Text2SQLService:
                     feedback=feedback,
                     trace=trace,
                 )
+                plan = self._augment_llm_plan(question, plan)
+                if (
+                    "rank_population_all" in plan.assumptions
+                    and plan.organization_scope == "selected"
+                    and plan.organizations
+                    and plan.current_date
+                ):
+                    plan = replace(plan, sql=compile_global_rank_sql(plan))
+                    trace.append({"stage": "deterministic_rank_compilation", "sql": plan.sql})
                 trace.append({"stage": "llm_plan", "attempt": attempt, "plan": plan.to_dict()})
                 if not plan.sql:
                     raise ConfigurationError("LLM计划缺少SQL")

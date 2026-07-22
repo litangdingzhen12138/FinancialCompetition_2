@@ -60,7 +60,7 @@ TEXT2SQL_DB_PATH=D:\path\bank_metrics.duckdb
 ## CLI
 
 ```powershell
-python -m text2sql.cli "江苏省A市农商行在2025年6月15日，各项存款余额是多少？"
+python -m text2sql.cli "把江苏省E市农商行2025年10月31日的不良率、拨备覆盖率、逾期率和资本充足率都列出来，并告诉我各自在全省排第几"
 python -m text2sql.cli "2026年3月末，哪家农商行的不良贷款率最低？" --json
 ```
 
