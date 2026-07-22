@@ -1,4 +1,8 @@
-"""Deterministic answers grounded only in executed query results."""
+"""Format answers strictly from executed query results.
+
+The rule path has a few stable renderers.  LLM queries use a schema-agnostic
+renderer so new SQL shapes do not require adding a question-specific branch.
+"""
 
 from __future__ import annotations
 
@@ -40,10 +44,15 @@ _COLUMN_LABELS = {
     "difference_from_average": "与全省均值之差",
     "difference": "差值",
     "sum_value": "合计",
+    "total_value": "合计",
+    "count": "数量",
+    "organization_count": "机构数",
+    "matching_days": "符合天数",
     "mom_change": "环比变动",
     "yoy_change": "同比变动",
     "previous_rank": "原排名",
     "current_rank": "当前排名",
+    "metric_rank": "排名",
     "rank_change": "排名变化",
     "rank_type": "排名分组",
 }
@@ -54,18 +63,44 @@ def _generic_answer(
     rows: list[dict[str, object]],
     catalog: SemanticCatalog,
 ) -> str:
+    """Render arbitrary read-only result shapes without interpreting new semantics."""
     fallback_org = catalog.organizations.get(plan.organizations[0], "") if len(plan.organizations) == 1 else ""
+    fallback_unit = catalog.unit_for_plan(plan.metrics, plan.derived_formula)
     answers: list[str] = []
     for row in rows:
         org_name = str(row.get("org_name") or fallback_org)
+        row_unit = str(row.get("unit") or fallback_unit) if len(plan.metrics) == 1 else ""
+        normalized_row = {key.lower(): value for key, value in row.items()}
+        named_units = {
+            key.removesuffix("_unit"): str(value)
+            for key, value in normalized_row.items()
+            if key.endswith("_unit") and value
+        }
         fields: list[str] = []
         for key, value in row.items():
-            if key in {"org_id", "org_name", "unit"}:
+            normalized = key.lower()
+            if normalized in {"org_id", "org_name", "unit"} or normalized.endswith("_unit"):
                 continue
-            if key == "metric_id" and isinstance(value, str) and value in catalog.metrics:
+            if normalized == "metric_id" and isinstance(value, str) and value in catalog.metrics:
                 value = f"{catalog.metrics[value].name}（{value}）"
-            label = _COLUMN_LABELS.get(key.lower(), key)
-            fields.append(f"{label}={_number(value)}")
+            label = _COLUMN_LABELS.get(normalized, key)
+            rendered = _number(value)
+            is_dimension = any(token in normalized for token in ("count", "rank", "date", "year", "month", "day"))
+            field_unit = row_unit
+            matching_units = [
+                (len(prefix), candidate_unit)
+                for prefix, candidate_unit in named_units.items()
+                if prefix and prefix in normalized
+            ]
+            if matching_units:
+                field_unit = max(matching_units)[1]
+            elif any(token in normalized for token in ("rate", "ratio", "share", "percent", "pct")):
+                field_unit = "%"
+            if field_unit and isinstance(value, (int, float)) and not isinstance(value, bool) and not is_dimension:
+                rendered = _value(value, field_unit)
+            elif normalized.endswith("rate") and value is not None:
+                rendered = _value(value, "%")
+            fields.append(f"{label}={rendered}")
         if not fields and org_name:
             answers.append(org_name)
             continue
@@ -92,6 +127,11 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
     }.get(plan.operation)
     if required_columns and any(not required_columns.issubset(row) for row in rows):
         return _generic_answer(plan, rows, catalog)
+    if plan.operation not in {
+        "value", "rank", "difference", "growth", "ratio",
+        "province_average_compare", "threshold", "daily_average", "quarterly_trend",
+    }:
+        return _generic_answer(plan, rows, catalog)
     if plan.operation == "value":
         return "；".join(
             f"{row['org_name']}：{_value(row['metric_value'], str(row.get('unit') or unit))}"
@@ -104,14 +144,13 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
             for row in rows
         )
     if plan.operation == "difference":
-        key = "change_value"
         pieces = []
         for row in rows:
-            if row.get("current_value") is None or row.get("comparison_value") is None or row.get(key) is None:
+            if row.get("current_value") is None or row.get("comparison_value") is None or row.get("change_value") is None:
                 missing = "当前期" if row.get("current_value") is None else "比较期"
                 pieces.append(f"{row['org_name']}：无法计算，缺少{missing}数据")
                 continue
-            change = float(row[key])
+            change = float(row["change_value"])
             direction = "增加" if change > 0 else "下降" if change < 0 else "持平"
             change_unit = "个百分点" if plan.metrics[0] in RATIO_METRICS else str(row.get("unit") or unit)
             pieces.append(
@@ -135,9 +174,7 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
             )
         return "；".join(pieces)
     if plan.operation == "ratio":
-        return "；".join(
-            f"{row['org_name']}：{_value(row['derived_value'], unit)}" for row in rows
-        )
+        return "；".join(f"{row['org_name']}：{_value(row['derived_value'], unit)}" for row in rows)
     if plan.operation == "province_average_compare":
         pieces = []
         for row in rows:
@@ -162,153 +199,7 @@ def format_answer(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog
             f"{row['org_name']}：日均{_value(row['average_value'], str(row.get('unit') or unit))}"
             for row in rows
         )
-    if plan.operation == "quarterly_trend":
-        pieces = [
-            f"{row['org_name']} {row['data_date']}：{_value(row['metric_value'], str(row.get('unit') or unit))}"
-            for row in rows
-        ]
-        if rows:
-            highest = max(rows, key=lambda row: float(row["metric_value"]))
-            pieces.append(
-                f"最高季度为{highest['data_date']}："
-                f"{_value(highest['metric_value'], str(highest.get('unit') or unit))}"
-            )
-        return "；".join(pieces)
-    if plan.operation == "annual_average_extrema":
-        return "；".join(
-            f"{row['rank_group']}{_number(row['group_rank'], 0)}名 {row['org_name']}："
-            f"年均{_value(row['average_value'], str(row.get('unit') or unit))}"
-            for row in rows
-        )
-    if plan.operation == "multi_metric_rank_change":
-        pieces = []
-        for row in rows:
-            change = row.get("rank_change")
-            if change is None:
-                pieces.append(f"{row['metric_name']}：缺少排名比较数据")
-                continue
-            change_value = int(change)
-            movement = "提升" if change_value < 0 else "下降" if change_value > 0 else "不变"
-            movement_text = movement if change_value == 0 else f"{movement}{abs(change_value)}名"
-            pieces.append(
-                f"{row['metric_name']}：第{_number(row['previous_rank'], 0)}名→"
-                f"第{_number(row['current_rank'], 0)}名，排名{movement_text}"
-            )
-        return "；".join(pieces)
-    if plan.operation == "metric_profile_rank":
-        return "；".join(
-            f"{row['metric_name']}：{_value(row['metric_value'], str(row.get('unit') or ''))}，"
-            f"第{_number(row['metric_rank'], 0)}名（{row['performance']}）"
-            for row in rows
-        )
-    if plan.operation == "mom_yoy_difference":
-        pieces = []
-        for row in rows:
-            change_unit = "个百分点" if row["metric_id"] in RATIO_METRICS else str(row.get("unit") or "")
-            if row.get("mom_change") is None or row.get("yoy_change") is None:
-                pieces.append(f"{row['org_name']} {row['metric_name']}：缺少上月或去年同期数据")
-                continue
-            pieces.append(
-                f"{row['org_name']} {row['metric_name']}：环比{_number(row['mom_change'])}{change_unit}，"
-                f"同比{_number(row['yoy_change'])}{change_unit}"
-            )
-        return "；".join(pieces)
-    if plan.operation == "period_global_extrema":
-        return "；".join(
-            f"单日{row['extrema_type']}：{row['org_name']}，{row['data_date']}，"
-            f"{_value(row['metric_value'], str(row.get('unit') or unit))}"
-            for row in rows
-        )
-    if plan.operation == "period_average_summary":
-        return "；".join(
-            f"{row['org_name']}：日均{_value(row['average_value'], str(row.get('unit') or unit))}，"
-            f"最高日{row['highest_date']}为{_value(row['highest_value'], str(row.get('unit') or unit))}，"
-            f"最低日{row['lowest_date']}为{_value(row['lowest_value'], str(row.get('unit') or unit))}"
-            for row in rows
-        )
-    if plan.operation == "component_shares":
-        return "；".join(
-            f"{row['org_name']}：{row['first_metric_name']}占比{_number(row['first_share'])}%，"
-            f"{row['second_metric_name']}占比{_number(row['second_share'])}%"
-            for row in rows
-        )
-    if plan.operation == "organization_sum":
-        row = rows[0]
-        return (
-            f"{_number(row['organization_count'], 0)}家机构{row['metric_name']}合计："
-            f"{_value(row['total_value'], str(row.get('unit') or unit))}"
-        )
-    if plan.operation == "cross_organization_difference":
-        row = rows[0]
-        difference = float(row["difference_value"])
-        first = str(row["first_org_name"])
-        second = str(row["second_org_name"])
-        higher, lower = (first, second) if difference >= 0 else (second, first)
-        difference_unit = "个百分点" if plan.metrics[0] in RATIO_METRICS else str(row.get("unit") or unit)
-        return (
-            f"{higher}高于{lower}{_number(abs(difference))}{difference_unit}"
-            f"（{first}{_value(row['first_value'], str(row.get('unit') or unit))}，"
-            f"{second}{_value(row['second_value'], str(row.get('unit') or unit))}）"
-        )
-    if plan.operation == "component_sum":
-        row = rows[0]
-        details = "，".join(
-            f"{item['metric_name']}{_value(item['metric_value'], str(item.get('unit') or ''))}"
-            for item in rows
-        )
-        return f"{row['org_name']}：{details}，合计{_value(row['total_value'], str(row.get('unit') or ''))}"
-    if plan.operation == "component_sum_compare":
-        row = rows[0]
-        relation = "等于" if row["is_equal"] else "不等于"
-        return (
-            f"{row['org_name']}：分项合计{_value(row['component_sum'], str(row.get('unit') or unit))}，"
-            f"{row['metric_name']}{_value(row['target_value'], str(row.get('unit') or unit))}，{relation}，"
-            f"差额{_value(row['difference_value'], str(row.get('unit') or unit))}"
-        )
-    if plan.operation == "province_average_count":
-        row = rows[0]
-        relation = "低于" if plan.filters[0].operator == "<" else "高于"
-        return (
-            f"共有{_number(row['organization_count'], 0)}家，{relation}全省均值"
-            f"（全省均值{_value(row['province_average'], unit)}）"
-        )
-    if plan.operation in {"period_growth_rank", "period_decline_rank"}:
-        key = "decline_value" if plan.operation == "period_decline_rank" else "growth_rate"
-        value_unit = "个百分点" if plan.operation == "period_decline_rank" else "%"
-        label = "下降" if plan.operation == "period_decline_rank" else "增幅"
-        return "；".join(
-            f"第{_number(row['metric_rank'], 0)}名 {row['org_name']}："
-            f"{label}{_number(row[key])}{value_unit}"
-            for row in rows
-        )
-    if plan.operation == "metric_difference":
-        row = rows[0]
-        difference = float(row["difference_value"])
-        first = str(row["first_metric_name"])
-        second = str(row["second_metric_name"])
-        relation = "高于" if difference > 0 else "低于" if difference < 0 else "等于"
-        return (
-            f"{row['org_name']}：{first}{relation}{second}"
-            f"{_number(abs(difference))}个百分点"
-            f"（{first}{_number(row['first_value'])}%，{second}{_number(row['second_value'])}%）"
-        )
-    if plan.operation == "days_vs_average":
-        row = rows[0]
-        relation = "低于" if plan.filters[0].operator == "<" else "高于"
-        return (
-            f"{row['org_name']}：全年共{_number(row['matching_days'], 0)}天{relation}全省均值"
-            f"（统计{_number(row['total_days'], 0)}天）"
-        )
-    if plan.operation == "multi_metric_difference":
-        pieces = []
-        for row in rows:
-            change = row.get("change_value")
-            if change is None:
-                pieces.append(f"{row['metric_name']}：缺少比较数据")
-                continue
-            change_value = float(change)
-            direction = "增加" if change_value > 0 else "下降" if change_value < 0 else "持平"
-            change_unit = "个百分点" if row["metric_id"] in RATIO_METRICS else str(row.get("unit") or "")
-            pieces.append(f"{row['metric_name']}：{direction}{_number(abs(change_value))}{change_unit}")
-        return "；".join(pieces)
-    return _generic_answer(plan, rows, catalog)
+    return "；".join(
+        f"{row['org_name']} {row['data_date']}：{_value(row['metric_value'], str(row.get('unit') or unit))}"
+        for row in rows
+    )

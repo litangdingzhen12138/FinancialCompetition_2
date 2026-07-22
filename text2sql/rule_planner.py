@@ -209,7 +209,7 @@ class RulePlanner:
                 return _fallback(candidates, "复合期间统计交由LLM规划")
             query_type, operation, rule_id = "period_average", "daily_average", "period_average_v1"
             current_date = end_date
-        elif start_date and end_date:
+        elif start_date and end_date and not current_date:
             return _fallback(candidates, "区间聚合语义超出基础规则，交由LLM规划")
         elif derived_formula:
             if len(organizations) != 1:

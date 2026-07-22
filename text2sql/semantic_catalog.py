@@ -73,10 +73,6 @@ DERIVED_METRICS: dict[str, dict[str, str | tuple[str, ...]]] = {
         "aliases": ("网点平均存款规模", "平均存款规模（万元/网点）", "平均存款规模(万元/网点)"),
         "numerator": "ZB001", "denominator": "ZB019", "unit": "万元/网点"
     },
-    "combined_npl_overdue_rate": {
-        "aliases": ("不良+逾期合计占贷款比", "不良率和逾期率合计"),
-        "numerator": "ZB013", "denominator": "ZB017", "unit": "%"
-    },
 }
 
 

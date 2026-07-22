@@ -23,7 +23,11 @@ expected_shape, allow_empty, derived_formula, confidence, assumptions, sql。
 filters元素字段为field, operator, value, reference。
 operation只能是value, rank, difference, growth, ratio, province_average_compare,
 threshold, daily_average, quarterly_trend, multi_condition, extrema, count_condition之一。
-organizations、metrics、dimensions、assumptions必须是字符串数组；confidence必须是0到1的数字。"""
+organizations、metrics、dimensions、assumptions必须是字符串数组；confidence必须是0到1的数字。
+SQL结果必须使用清晰稳定的列别名；金额或比率结果应同时返回unit列。优先使用org_id、org_name、
+metric_id、metric_name、unit、metric_value、result_value、count_value、metric_rank、data_date等通用别名，
+使结果无需针对具体问题编写格式化代码。多指标且单位不同时，优先每行返回一个指标的长表结构；
+如必须横向展开，每个数值字段必须有对应的<字段前缀>_unit列。"""
 
 
 OPERATION_ALIASES = {

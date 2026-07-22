@@ -16,13 +16,7 @@ from .semantic_catalog import APPROVED_TABLES, RATIO_METRICS, SemanticCatalog
 ALLOWED_OPERATIONS = {
     "value", "rank", "difference", "growth", "ratio", "province_average_compare",
     "threshold", "daily_average", "quarterly_trend", "multi_condition",
-    "extrema", "count_condition", "annual_average_extrema", "multi_metric_rank_change",
-    "metric_profile_rank", "mom_yoy_difference", "period_global_extrema", "period_average_summary",
-    "component_shares", "organization_sum", "cross_organization_difference",
-    "component_sum", "component_sum_compare", "province_average_count",
-    "period_growth_rank", "period_decline_rank", "metric_difference",
-    "days_vs_average", "multi_metric_difference",
-    "profitability_assessment", "multi_metric_average_condition",
+    "extrema", "count_condition",
 }
 EXTERNAL_ACCESS = re.compile(
     r"\b(read_csv(?:_auto)?|read_parquet|read_json(?:_auto)?|read_xlsx|sqlite_scan|postgres_scan|httpfs|glob)\s*\(",
@@ -60,44 +54,10 @@ class PlanValidator:
             raise ValidationError("比率类指标不计算增幅，应计算百分点差")
         if plan.operation == "ratio" and (len(plan.metrics) != 2 or not plan.derived_formula):
             raise ValidationError("派生比率必须包含分子、分母和公式标识")
-        if plan.operation in {"daily_average", "period_average_summary", "quarterly_trend"} and (
+        if plan.operation in {"daily_average", "quarterly_trend"} and (
             not plan.start_date or not plan.end_date
         ):
             raise ValidationError("期间统计缺少开始或结束日期")
-        if plan.operation == "annual_average_extrema" and (not plan.start_date or not plan.end_date):
-            raise ValidationError("年度均值排名缺少开始或结束日期")
-        if plan.operation == "multi_metric_rank_change" and (not plan.current_date or not plan.comparison_date):
-            raise ValidationError("多指标排名变化缺少当前日期或比较日期")
-        if plan.operation == "metric_profile_rank" and not plan.current_date:
-            raise ValidationError("指标画像排名缺少查询日期")
-        if plan.operation == "mom_yoy_difference" and (
-            not plan.current_date or not plan.comparison_date or not plan.start_date
-        ):
-            raise ValidationError("环比同比查询缺少当前、上月或去年同期日期")
-        if plan.operation == "period_global_extrema" and (not plan.start_date or not plan.end_date):
-            raise ValidationError("区间单日极值缺少开始或结束日期")
-        if plan.operation in {
-            "component_shares", "organization_sum", "cross_organization_difference",
-            "component_sum", "component_sum_compare", "province_average_count",
-            "metric_difference",
-        } and not plan.current_date:
-            raise ValidationError("查询缺少当前日期")
-        if plan.operation in {"period_growth_rank", "period_decline_rank"} and (
-            not plan.current_date or not plan.comparison_date
-        ):
-            raise ValidationError("期间变化排名缺少当前日期或比较日期")
-        if plan.operation == "days_vs_average" and (not plan.start_date or not plan.end_date):
-            raise ValidationError("按日比较全省均值缺少开始或结束日期")
-        if plan.operation == "multi_metric_difference" and (
-            not plan.current_date or not plan.comparison_date
-        ):
-            raise ValidationError("多指标期间比较缺少当前日期或比较日期")
-        if plan.operation == "profitability_assessment" and (
-            not plan.current_date or not plan.comparison_date
-        ):
-            raise ValidationError("盈利能力评估缺少当前日期或年初日期")
-        if plan.operation == "multi_metric_average_condition" and not plan.current_date:
-            raise ValidationError("多指标均值条件查询缺少当前日期")
         if plan.operation == "rank" and plan.sort_direction not in {"asc", "desc"}:
             raise ValidationError("排名查询缺少排序方向")
         if plan.limit is not None and not 1 <= plan.limit <= 1000:
@@ -181,7 +141,14 @@ class AlignmentValidator:
             for org in plan.organizations:
                 if org.upper() not in upper:
                     raise ValidationError(f"SQL遗漏机构：{org}")
-        for value in (plan.current_date, plan.comparison_date, plan.start_date, plan.end_date):
+        required_dates: list[str | None] = [plan.current_date]
+        if plan.operation in {"difference", "growth"} or (
+            plan.operation == "multi_condition" and plan.comparison_date
+        ):
+            required_dates.append(plan.comparison_date)
+        if plan.operation in {"daily_average", "quarterly_trend", "extrema"} or not plan.current_date:
+            required_dates.extend((plan.start_date, plan.end_date))
+        for value in required_dates:
             if value and value not in sql:
                 raise ValidationError(f"SQL遗漏日期条件：{value}")
         if plan.operation == "rank":
@@ -197,7 +164,7 @@ class AlignmentValidator:
             raise ValidationError("省均值比较SQL未计算AVG")
         if plan.operation == "growth" and "NULLIF" not in upper:
             raise ValidationError("增幅SQL缺少除零保护")
-        if plan.operation == "ratio" and plan.derived_formula != "combined_npl_overdue_rate" and "NULLIF" not in upper:
+        if plan.operation == "ratio" and "NULLIF" not in upper:
             raise ValidationError("派生比率SQL缺少除零保护")
 
 
