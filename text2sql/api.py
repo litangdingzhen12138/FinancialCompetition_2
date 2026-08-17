@@ -97,6 +97,9 @@ def user_context(
             return get_auth_service().resolve_bearer(authorization).to_context()
         except PermissionError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
+    allow_header_auth = os.getenv("TEXT2SQL_ALLOW_HEADER_AUTH", "true").strip().lower()
+    if allow_header_auth not in {"1", "true", "yes", "on"}:
+        raise HTTPException(status_code=401, detail="请先登录")
     if x_user_role not in {"viewer", "analyst", "admin"}:
         raise HTTPException(status_code=400, detail="X-User-Role必须是viewer、analyst或admin")
     organizations = tuple(
@@ -597,7 +600,11 @@ def shared_query(
     x_user_role: str = Header(default="viewer"),
     x_org_scope: str = Header(default="", max_length=2000),
 ) -> dict[str, object]:
-    user = user_context(x_user_id, x_user_role, x_org_scope)
+    user = UserContext(
+        user_id="shared-viewer",
+        role="viewer",
+        allowed_organizations=(),
+    )
     try:
         return get_product_service().resolve_share(token, user).to_dict()
     except Exception as exc:

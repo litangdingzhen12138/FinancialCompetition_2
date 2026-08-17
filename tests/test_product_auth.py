@@ -1,4 +1,6 @@
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+import pytest
 
 from text2sql import api
 
@@ -65,6 +67,15 @@ def test_login_logout_and_relogin(monkeypatch) -> None:
     assert relogged.status_code == 200
     assert relogged.json()["access_token"] != token
     api.get_auth_service.cache_clear()
+
+
+def test_header_auth_can_be_disabled_in_public_deployments(monkeypatch) -> None:
+    monkeypatch.setenv("TEXT2SQL_ALLOW_HEADER_AUTH", "false")
+
+    with pytest.raises(HTTPException) as exc_info:
+        api.user_context("spoofed-admin", "admin", "", None)
+
+    assert exc_info.value.status_code == 401
 
 
 def test_admin_audit_user_query_parameter_filters_without_shadowing_context(

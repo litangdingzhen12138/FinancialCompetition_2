@@ -1,0 +1,19 @@
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN python -m pip install --upgrade pip && \
+    python -m pip install -r requirements.txt
+
+COPY text2sql ./text2sql
+COPY ["比赛数据/22-多模态技术与数据治理赛道-江苏农商联合银行-基于大模型与NL2SQL的银行业智能问数系统构建与应用/基于大模型与NL2SQL的银行业智能问数系统构建与应用_数据集.xlsx", "/app/source/dataset.xlsx"]
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "text2sql.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

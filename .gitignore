@@ -8,6 +8,8 @@ __pycache__/
 *.sqlite3-shm
 *.sqlite3-wal
 .env
+.env.production
+deploy-data/
 
 # Virtual environment
 .venv/
@@ -21,6 +23,7 @@ bank_text2sql.egg-info/
 # Tool caches
 .codex_analysis/
 .codex_work/
+.deploy/
 
 # Generated outputs (previews, workbooks, run artifacts)
 outputs/

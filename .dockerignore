@@ -1,7 +1,9 @@
 .git/
+.deploy/
 .env
 .env.*
 !.env.example
+!.env.production.example
 .venv/
 .deps/
 __pycache__/
@@ -12,6 +14,7 @@ __pycache__/
 *.sqlite3
 *.sqlite3-*
 data/
+deploy-data/
 outputs/
 results/
 frontend/.env*
