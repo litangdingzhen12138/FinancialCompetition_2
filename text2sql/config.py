@@ -22,6 +22,7 @@ DEFAULT_XLSX = (
 class Settings:
     xlsx_path: Path
     db_path: Path
+    product_db_path: Path = PROJECT_ROOT / "data" / "product.sqlite3"
     default_row_limit: int = 200
     hard_row_limit: int = 1000
     llm_url: str | None = None
@@ -40,6 +41,12 @@ class Settings:
         return cls(
             xlsx_path=xlsx_path,
             db_path=db_path,
+            product_db_path=Path(
+                os.getenv(
+                    "TEXT2SQL_PRODUCT_DB_PATH",
+                    str(PROJECT_ROOT / "data" / "product.sqlite3"),
+                )
+            ),
             default_row_limit=int(os.getenv("TEXT2SQL_DEFAULT_ROW_LIMIT", "200")),
             hard_row_limit=int(os.getenv("TEXT2SQL_HARD_ROW_LIMIT", "1000")),
             llm_url=os.getenv("TEXT2SQL_LLM_URL"),

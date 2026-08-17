@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 
 PlanSource = Literal["rule", "llm"]
+AnswerMode = Literal["rule", "llm"]
 ResultShape = Literal["single_value", "single_row", "multi_row", "time_series"]
 
 
@@ -70,6 +71,25 @@ class SessionState:
     last_query_type: str | None = None
     last_result_organizations: tuple[str, ...] = ()
     recent_turns: tuple["TurnMemory", ...] = ()
+    pending_query: "PendingQuery | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingQuery:
+    """An incomplete query waiting for explicit slot values from the user."""
+
+    original_question: str
+    working_question: str
+    organizations: tuple[str, ...] = ()
+    metrics: tuple[str, ...] = ()
+    current_date: str | None = None
+    comparison_date: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    organization_scope: Literal["selected", "all"] = "selected"
+    missing_slots: tuple[str, ...] = ()
+    supplements: tuple[str, ...] = ()
+    clarification_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +103,7 @@ class TurnMemory:
 @dataclass(frozen=True, slots=True)
 class QueryResponse:
     answer: str
+    answer_mode: AnswerMode
     session_id: str
     route: PlanSource
     sql: str

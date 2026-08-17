@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from typing import Any
 
@@ -31,14 +32,31 @@ SQL结果必须使用清晰稳定的列别名；金额或比率结果应同时�
 metric_id、metric_name、unit、metric_value、result_value、count_value、metric_rank、data_date等通用别名，
 使结果无需针对具体问题编写格式化代码。多指标且单位不同时，优先每行返回一个指标的长表结构；
 如必须横向展开，每个数值字段必须有对应的<字段前缀>_unit列。
-跨单位金额比率必须先统一量纲，并保证公式与unit完全一致。例如净利润单位为万元、存款单位为亿元时，
-若返回百分比，应计算“净利润/(存款*10000)*100”，unit必须为“%”；不得把无量纲结果标成“万元/亿元”。
+派生比率必须服从指标目录约定，并保证公式与unit一致。比赛口径中的“净利润/存款比”是明确特例：
+按净利润表面值/存款表面值×100%计算，不做万元与亿元换算；其他跨单位金额比率仍应先统一量纲。
 CTE和表别名必须使用非保留英文名称（如base_data、aggregated_values、pv）；禁止把DuckDB保留字
 用作未加引号的标识符，尤其禁止使用pivot、unpivot作为裸CTE名或表别名。
 必须覆盖问题中的每个子问题：若同时询问“哪些机构”和“一共有几家”，结果必须同时返回机构列表和总数；
 若同时询问两家谁高和相差多少，结果必须包含两家数值及差值；若询问趋势的最高和最低，必须返回可确定极值的完整序列。
 只返回用户要求的指标，不得额外返回其他指标。计算某机构的全省排名时，必须先对全省机构做窗口排名，
 再在外层筛选目标机构，禁止先筛选目标机构再计算排名。"""
+
+
+REWRITE_SYSTEM_PROMPT = """你是多轮问数问题改写器。只输出一个JSON对象，不要Markdown，也不要生成SQL。
+任务是把当前问题改写为脱离历史也能理解的完整问题。
+只能用提供的历史补充当前问题省略的机构、指标、日期、比较期和查询操作；不得编造历史中不存在的信息。
+当前问题明确给出的内容优先于历史，不得被历史覆盖。必须保留当前问题的全部比较、排名、差值、阈值、
+计数、趋势、极值和综合判断要求，不得只改写其中一部分。
+如果历史中存在多个候选而无法唯一确定，不能猜测：rewritten_question返回空字符串，并在
+unresolved_references中列出需要用户明确的引用。
+输出字段：rewritten_question（字符串）、used_turn_indexes（整数数组）、unresolved_references（字符串数组）。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ContextRewrite:
+    rewritten_question: str
+    used_turn_indexes: tuple[int, ...]
+    unresolved_references: tuple[str, ...]
 
 
 OPERATION_ALIASES = {
@@ -90,6 +108,24 @@ def _assumptions(value: Any) -> tuple[str, ...]:
 
 def _optional_string(value: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def parse_context_rewrite(content: str) -> ContextRewrite:
+    value = _extract_json(content)
+    rewritten = value.get("rewritten_question")
+    if not isinstance(rewritten, str):
+        raise PlanningError("上下文改写缺少rewritten_question")
+    raw_indexes = value.get("used_turn_indexes") or []
+    if not isinstance(raw_indexes, list) or not all(
+        isinstance(item, int) and not isinstance(item, bool) for item in raw_indexes
+    ):
+        raise PlanningError("上下文改写的used_turn_indexes格式错误")
+    unresolved = _strings(value.get("unresolved_references"))
+    return ContextRewrite(
+        rewritten_question=rewritten.strip(),
+        used_turn_indexes=tuple(raw_indexes),
+        unresolved_references=unresolved,
+    )
 
 
 def parse_llm_plan(content: str) -> QueryPlan:
@@ -187,41 +223,97 @@ class LLMPlanner:
         state: SessionState,
         feedback: str | None = None,
         trace: list[dict[str, Any]] | None = None,
+        *,
+        include_history: bool = False,
+        history_limit: int = 10,
     ) -> QueryPlan:
-        if not self.available:
-            raise ConfigurationError(
-                "LLM兜底未配置；请设置TEXT2SQL_LLM_URL和TEXT2SQL_LLM_API_KEY"
-            )
         payload_context = {
             "schema": schema_context,
             "question": question,
             "rule_candidates": rule_candidates,
-            "session_state": {
+            "previous_failure": feedback,
+        }
+        if include_history:
+            payload_context["conversation_context"] = self._history_context(
+                state,
+                history_limit,
+            )
+        raw_content = self._request(
+            system_prompt=SYSTEM_PROMPT,
+            payload=payload_context,
+            trace=trace,
+            stage_prefix="llm",
+        )
+        return parse_llm_plan(raw_content)
+
+    def rewrite(
+        self,
+        question: str,
+        state: SessionState,
+        *,
+        history_limit: int,
+        feedback: str | None = None,
+        trace: list[dict[str, Any]] | None = None,
+    ) -> ContextRewrite:
+        payload_context = {
+            "question": question,
+            "conversation_context": self._history_context(state, history_limit),
+            "previous_failure": feedback,
+        }
+        raw_content = self._request(
+            system_prompt=REWRITE_SYSTEM_PROMPT,
+            payload=payload_context,
+            trace=trace,
+            stage_prefix="context_rewrite",
+        )
+        return parse_context_rewrite(raw_content)
+
+    @staticmethod
+    def _history_context(state: SessionState, history_limit: int) -> dict[str, object]:
+        limit = 20 if history_limit >= 20 else 10
+        selected_turns = state.recent_turns[-limit:]
+        return {
+            "focus_state": {
                 "last_organizations": state.last_organizations,
                 "last_result_organizations": state.last_result_organizations,
                 "last_metrics": state.last_metrics,
                 "last_date": state.last_date,
                 "last_comparison_date": state.last_comparison_date,
                 "last_operation": state.last_operation,
-                "recent_turns": [
-                    {
-                        "question": turn.question,
-                        "answer": turn.answer[:1000],
-                        "plan": {
-                            "organizations": turn.plan.organizations,
-                            "metrics": turn.plan.metrics,
-                            "current_date": turn.plan.current_date,
-                            "comparison_date": turn.plan.comparison_date,
-                            "operation": turn.plan.operation,
-                        },
-                    }
-                    for turn in state.recent_turns[-20:]
-                ],
             },
-            "previous_failure": feedback,
+            "recent_turns": [
+                {
+                    "turn_index": index,
+                    "question": turn.question,
+                    "answer": turn.answer[:1000],
+                    "plan": {
+                        "organizations": turn.plan.organizations,
+                        "metrics": turn.plan.metrics,
+                        "current_date": turn.plan.current_date,
+                        "comparison_date": turn.plan.comparison_date,
+                        "operation": turn.plan.operation,
+                    },
+                }
+                for index, turn in enumerate(selected_turns, start=1)
+            ],
         }
+
+    def _request(
+        self,
+        *,
+        system_prompt: str,
+        payload: dict[str, object],
+        trace: list[dict[str, Any]] | None,
+        stage_prefix: str,
+    ) -> str:
+        if not self.available:
+            raise ConfigurationError(
+                "LLM兜底未配置；请设置TEXT2SQL_LLM_URL和TEXT2SQL_LLM_API_KEY"
+            )
+        request_stage = f"{stage_prefix}_request"
+        response_stage = f"{stage_prefix}_response"
         if trace is not None:
-            trace.append({"stage": "llm_request", "context": payload_context})
+            trace.append({"stage": request_stage, "context": payload})
         try:
             response = requests.post(
                 self.settings.llm_url,
@@ -232,8 +324,8 @@ class LLMPlanner:
                 json={
                     "model": self.settings.llm_model,
                     "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": json.dumps(payload_context, ensure_ascii=False)},
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],
                     "temperature": 0,
                     "stream": False,
@@ -246,13 +338,29 @@ class LLMPlanner:
             content = response.json()["choices"][0]["message"]["content"]
         except requests.RequestException as exc:
             if trace is not None:
-                trace.append({"stage": "llm_transport_error", "error": f"{type(exc).__name__}: {exc}"})
+                trace.append(
+                    {
+                        "stage": f"{stage_prefix}_transport_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
             raise PlanningError(f"LLM网络调用失败：{type(exc).__name__}") from exc
         except (KeyError, TypeError, ValueError) as exc:
             if trace is not None:
-                trace.append({"stage": "llm_response_error", "error": f"{type(exc).__name__}: {exc}"})
+                trace.append(
+                    {
+                        "stage": f"{stage_prefix}_response_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
             raise PlanningError(f"LLM调用失败：{type(exc).__name__}") from exc
         raw_content = str(content)
         if trace is not None:
-            trace.append({"stage": "llm_response", "status_code": response.status_code, "content": raw_content})
-        return parse_llm_plan(raw_content)
+            trace.append(
+                {
+                    "stage": response_stage,
+                    "status_code": response.status_code,
+                    "content": raw_content,
+                }
+            )
+        return raw_content

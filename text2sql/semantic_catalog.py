@@ -87,7 +87,8 @@ DERIVED_METRICS: dict[str, dict[str, str | tuple[str, ...]]] = {
         "aliases": ("净利息收入占营业收入", "净利息收入比重"), "numerator": "ZB008", "denominator": "ZB009", "unit": "%"
     },
     "profit_per_employee": {
-        "aliases": ("人均利润", "人均净利润"), "numerator": "ZB011", "denominator": "ZB018", "unit": "万元/人"
+        "aliases": ("人均利润", "人均净利润"), "numerator": "ZB011", "denominator": "ZB018",
+        "unit": "万元/人", "multiplier": "1.0"
     },
     "npl_balance_share": {
         "aliases": ("不良贷款余额占贷款总额", "不良余额占贷款", "按余额计算的不良贷款占比", "不良贷款按余额占比"),
@@ -98,10 +99,12 @@ DERIVED_METRICS: dict[str, dict[str, str | tuple[str, ...]]] = {
         "numerator": "ZB011",
         "denominator": "ZB001",
         "unit": "%",
+        "multiplier": "100.0",
     },
     "deposit_per_branch": {
         "aliases": ("网点平均存款规模", "平均存款规模（万元/网点）", "平均存款规模(万元/网点)"),
-        "numerator": "ZB001", "denominator": "ZB019", "unit": "万元/网点"
+        "numerator": "ZB001", "denominator": "ZB019", "unit": "万元/网点",
+        "multiplier": "10000.0"
     },
 }
 

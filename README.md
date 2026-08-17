@@ -18,6 +18,16 @@
 
 当前版本不使用 LangGraph。多轮对话通过 `session_id + 结构化SessionState` 实现；默认进程内存储，后续可以将 `InMemorySessionStore` 替换为 Redis。
 
+## 账户密码
+
+业务分析员
+账号：`analyst`
+密码：`analyst123`
+
+系统管理员
+账号：`admin`
+密码：`admin123`
+
 ## 主要能力
 
 - Excel首次启动自动构建 DuckDB，后续按源文件大小和修改时间复用；
@@ -85,7 +95,7 @@ answer = run.run("江苏省A市农商行在2025年6月15日，各项存款余额
 ## FastAPI
 
 ```powershell
-uvicorn text2sql.api:app --host 0.0.0.0 --port 8000
+python -m uvicorn text2sql.api:app --host 127.0.0.1 --port 8000
 ```
 
 请求：
@@ -98,6 +108,66 @@ POST /query
 }
 ```
 
+## 产品化工作台
+
+项目现已增加版本化产品接口和响应式 PC/H5 工作台。原 `/query` 保持兼容，
+新增 `/api/v1` 能力包括：
+
+- 问数全流程编排，查询数据和图表优先返回；
+- 最终回答采用规则优先、LLM 兜底，未命中规则时通过独立 SSE 接口流式返回；
+- 确定性图表智能推荐；
+- 年、季度、月、日时间下钻，当前统一采用期末值口径；
+- 查询历史、详情回溯、Excel/CSV 导出和限时分享；
+- viewer / analyst / admin 角色权限、敏感指标脱敏；
+- 查询、下钻、导出、分享、失败操作审计；
+- 管理概览和审计查询。
+
+### 本地启动
+
+前后端需要分别占用一个终端，并且都从项目根目录
+`D:\PycharmProject\FinancialCompetition_2` 开始执行。
+
+终端一，启动后端（端口 `8000`）：
+
+```powershell
+python -m uvicorn text2sql.api:app --host 127.0.0.1 --port 8000
+```
+
+后端接口地址：`http://127.0.0.1:8000`。
+
+终端二，启动前端（端口 `3101`）：
+
+```powershell
+cd frontend
+npm install  # 仅首次运行或依赖发生变化时需要执行
+npm run dev -- --port 3101
+```
+
+浏览器访问：`http://localhost:3101`。
+
+前端默认连接 `http://127.0.0.1:8000`，可通过
+`frontend/.env.local` 中的 `NEXT_PUBLIC_API_BASE_URL` 修改。停止服务时，
+在对应终端按 `Ctrl+C`。
+
+产品历史和审计数据默认存储在 `data/product.sqlite3`，可通过
+`TEXT2SQL_PRODUCT_DB_PATH` 修改。该 SQLite 存储用于比赛和单机演示；
+正式银行部署时应通过持久化仓储适配器替换为目标国产数据库。
+生产环境前端来源通过 `TEXT2SQL_CORS_ORIGINS` 配置，多个来源用英文逗号分隔。
+
+产品工作台的查询与最终回答采用两个独立链路：
+
+```text
+POST /api/v1/queries/stream
+GET  /api/v1/queries/{query_id}/answer/stream
+```
+
+第一个接口完成 Text2SQL、SQL 执行和图表推荐。若已有确定性回答规则，
+响应中的 `answer_mode` 为 `rule`、`answer_status` 为 `completed`，不会再次调用
+LLM。未命中回答规则时，`answer_mode` 为 `llm`、`answer_status` 为 `pending`；
+前端先渲染查询数据和图表，再使用第二个接口流式填充“最终回答”。最终回答
+调用失败不会影响已返回的数据和图表，成功后会写回历史记录，供导出、分享和
+历史回溯使用。
+
 ## LLM兜底配置
 
 只有规则无法完整覆盖时才需要LLM：
@@ -108,7 +178,11 @@ TEXT2SQL_LLM_API_KEY=your-deepseek-api-key
 TEXT2SQL_LLM_MODEL=deepseek-v4-flash
 ```
 
-LLM必须返回结构化QueryPlan和SQL。生成结果不会直接执行，仍需经过与规则SQL相同的完整校验链路。默认允许一次初始生成和一次带脱敏反馈的修复。
+SQL规划阶段的LLM必须返回结构化QueryPlan和SQL。生成结果不会直接执行，
+仍需经过与规则SQL相同的完整校验链路。默认允许一次初始生成和一次带脱敏
+反馈的修复。最终回答阶段复用同一套模型连接配置，但只接收原始问题和已经
+执行完成的SQL结果，并关闭深度思考；提示词要求仅依据结果、使用简洁银行
+业务语言回答，不得编造原因或扩展无关结论。
 
 ## 测试
 

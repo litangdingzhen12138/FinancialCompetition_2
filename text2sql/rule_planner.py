@@ -11,6 +11,7 @@ from calendar import monthrange
 from dataclasses import dataclass
 import re
 
+from .context_router import ContextRouter
 from .date_resolver import comparison_date, resolve_date, year_beginning
 from .models import PlanFilter, QueryPlan, SessionState
 from .semantic_catalog import (
@@ -24,7 +25,6 @@ from .semantic_catalog import (
     MAJOR_OPERATING_METRICS,
     METRIC_ALIASES,
     SemanticCatalog,
-    contains_pronoun_reference,
 )
 
 
@@ -207,24 +207,35 @@ class RulePlanner:
 
     def __init__(self, catalog: SemanticCatalog) -> None:
         self.catalog = catalog
+        self.context_router = ContextRouter(catalog)
 
-    def plan(self, raw_question: str, state: SessionState) -> RuleDecision:
+    def plan(
+        self,
+        raw_question: str,
+        state: SessionState,
+        *,
+        use_context: bool | None = None,
+    ) -> RuleDecision:
+        if use_context is None:
+            context = self.context_router.classify(raw_question, state)
+            if context.needs_history and not context.allow_context_rule:
+                return _fallback(
+                    {
+                        "context_dependency": context.dependency,
+                        "history_limit": context.history_limit,
+                    },
+                    context.reason,
+                )
+            use_context = context.allow_context_rule
         question = normalize_question(raw_question)
-        pronoun_reference = contains_pronoun_reference(question)
         explicit_orgs = self.catalog.resolve_organizations(question)
         population_intent = bool(
             re.search(r"哪家|哪些|多少家|有几家|前\d|后\d|前三|后三|最高的?[一二三\d]|最低的?[一二三\d]", question)
         )
-        contextual_continuation = bool(
-            state.last_date
-            and not population_intent
-            and (not explicit_orgs or explicit_orgs == state.last_organizations)
-        )
-        has_reference = pronoun_reference or contextual_continuation
 
         organizations = explicit_orgs
         inherited_orgs = False
-        if not organizations and has_reference:
+        if not organizations and use_context:
             organizations = state.last_result_organizations or state.last_organizations
             inherited_orgs = bool(organizations)
 
@@ -260,14 +271,21 @@ class RulePlanner:
             metrics = PERFORMANCE_PROFILE_METRICS
         elif is_risk_profile:
             metrics = RISK_PROFILE_METRICS
-        elif not metrics and has_reference:
+        elif not metrics and use_context:
             metrics = state.last_metrics
 
-        current_date = resolve_date(question, state.last_date) or (state.last_date if has_reference else None)
+        reference_date = state.last_date if use_context else None
+        current_date = resolve_date(question, reference_date) or reference_date
         comparison_value = comparison_kind = None
         if current_date:
-            comparison_value, comparison_kind = comparison_date(question, current_date, state.last_date)
+            comparison_value, comparison_kind = comparison_date(
+                question,
+                current_date,
+                reference_date,
+            )
         if (
+            use_context
+            and
             not comparison_value
             and state.last_comparison_date
             and re.search(r"这个增量|同期变化", question)
@@ -300,8 +318,10 @@ class RulePlanner:
 
         candidates: dict[str, object] = {
             "organizations": organizations,
+            "organization_scope": organization_scope,
             "explicit_organizations": explicit_orgs,
             "inherited_organizations": inherited_orgs,
+            "context_used": use_context,
             "metrics": metrics,
             "current_date": current_date,
             "comparison_date": comparison_value,

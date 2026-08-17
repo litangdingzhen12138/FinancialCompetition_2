@@ -32,6 +32,29 @@ def _difference_number(value: float) -> str:
     return _number(value, 4 if value and round(abs(value), 2) == 0 else 2)
 
 
+def _value_requested_before_change(question: str) -> bool:
+    """Whether the user asks for the current value before asking for its change."""
+    clauses = [
+        clause
+        for clause in re.split(r"[？?；;。！!，,]", re.sub(r"\s+", "", question))
+        if clause
+    ]
+    saw_value = False
+    for clause in clauses:
+        asks_change = bool(
+            re.search(
+                r"(?:相比|比|较|变化|变动|增长|增加|下降|减少|回落|上升|升高|降低)"
+                r".*(?:多少|如何|怎么样|怎么变)",
+                clause,
+            )
+        )
+        if asks_change:
+            return saw_value
+        if re.search(r"(?:是多少|有多少|为多少|多少)$", clause):
+            saw_value = True
+    return False
+
+
 _COLUMN_LABELS = {
     "metric_id": "指标编码",
     "metric_name": "指标",
@@ -66,6 +89,52 @@ _COLUMN_LABELS = {
     "maximum_value": "最高值",
     "minimum_value": "最低值",
 }
+
+_REQUIRED_COLUMNS_BY_OPERATION = {
+    "value": {"org_name", "metric_value"},
+    "rank": {"org_name", "metric_value", "metric_rank"},
+    "difference": {"org_name", "current_value", "comparison_value", "change_value"},
+    "growth": {"org_name", "current_value", "comparison_value", "growth_rate"},
+    "ratio": {"org_name", "derived_value"},
+    "province_average_compare": {
+        "org_name", "metric_value", "province_average", "difference_from_average"
+    },
+    "threshold": {"org_name", "metric_value", "threshold_met"},
+    "daily_average": {"org_name", "average_value"},
+    "quarterly_trend": {"org_name", "data_date", "metric_value"},
+    "sum": {"metric_name", "metric_value", "total_value"},
+    "composition": {"metric_name", "derived_value"},
+    "mom_yoy": {"org_name", "current_value", "mom_change", "yoy_change"},
+    "count_vs_average": {"matching_organizations", "total_organizations"},
+    "count_condition": {"matching_organizations", "total_organizations"},
+    "profile": {"org_name", "metric_id", "metric_name", "metric_value", "metric_rank"},
+    "cross_difference": {"metric_name", "metric_value", "difference_value"},
+    "period_rank_extremes": {"org_name", "average_value", "rank_type", "metric_rank"},
+    "period_extrema": {"org_name", "data_date", "metric_value", "extrema_type"},
+    "multi_period_change": {"metric_name", "comparison_value", "current_value", "change_value"},
+    "multi_rank_change": {
+        "metric_name", "comparison_value", "current_value", "previous_rank", "current_rank"
+    },
+    "period_change_rank": {"org_name", "result_value", "result_rank"},
+    "multi_rank": {"metric_name", "metric_value", "metric_rank"},
+    "three_dimension_profile": {"metric_id", "metric_name", "metric_value", "metric_rank"},
+    "reconcile": {"corporate_value", "personal_value", "total_value", "difference_value", "is_equal"},
+    "multi_metric_province_compare": {
+        "org_name", "metric_id", "metric_name", "metric_value", "province_average"
+    },
+}
+_RULE_ANSWER_OPERATIONS = frozenset(_REQUIRED_COLUMNS_BY_OPERATION)
+
+
+def has_deterministic_answer(plan: QueryPlan, result: QueryResult) -> bool:
+    """Return whether an explicit answer template covers this executed result."""
+    rows = result.dictionaries()
+    if not rows or plan.operation not in _RULE_ANSWER_OPERATIONS:
+        return False
+    required_columns = _REQUIRED_COLUMNS_BY_OPERATION[plan.operation]
+    if plan.operation == "count_vs_average" and plan.start_date:
+        required_columns = {"matching_days", "total_days", "matching_percentage"}
+    return all(required_columns.issubset(row) for row in rows)
 
 
 def _generic_answer(
@@ -123,7 +192,10 @@ def _generic_answer(
         fallback_org = catalog.organizations.get(plan.organizations[0], "") if len(plan.organizations) == 1 else ""
         conclusion = "同时满足全部条件" if all(statuses) else "未同时满足全部条件"
         return f"{fallback_org}：{'；'.join(pieces)}；综合判定：{conclusion}"
-    if len(rows) == 1 and any(key.lower() == "meets_all_conditions" for key in rows[0]):
+    all_condition_aliases = {"meetsallconditions", "allconditionsmet"}
+    if len(rows) == 1 and any(
+        key.lower().replace("_", "") in all_condition_aliases for key in rows[0]
+    ):
         normalized = {key.lower().replace("_", ""): value for key, value in rows[0].items()}
 
         column_aliases = {
@@ -167,7 +239,9 @@ def _generic_answer(
                 text += f"（{relation}全省均值{_value(province_average, '%')}）"
             pieces.append(text)
         raw_status = next(
-            value for key, value in rows[0].items() if key.lower() == "meets_all_conditions"
+            value
+            for key, value in rows[0].items()
+            if key.lower().replace("_", "") in all_condition_aliases
         )
         meets = raw_status is True or str(raw_status).strip().lower() in {"true", "1", "是", "满足", "达标"}
         org_name = str(rows[0].get("org_name") or (
@@ -255,61 +329,24 @@ def _generic_answer(
     if "require_organization_list" in plan.assumptions:
         organization_count = len({str(row.get("org_id") or row.get("org_name")) for row in rows if row.get("org_id") or row.get("org_name")})
         if organization_count:
-            answer = f"{answer}；共{organization_count}家"
+            answer = f"共有{organization_count}家，分别为：{answer}"
     return answer
 
 
-def _format_answer_core(plan: QueryPlan, result: QueryResult, catalog: SemanticCatalog) -> str:
+def _format_answer_core(
+    plan: QueryPlan,
+    result: QueryResult,
+    catalog: SemanticCatalog,
+    question: str = "",
+) -> str:
     rows = result.dictionaries()
     unit = catalog.unit_for_plan(plan.metrics, plan.derived_formula)
-    required_columns = {
-        "value": {"org_name", "metric_value"},
-        "rank": {"org_name", "metric_value", "metric_rank"},
-        "difference": {"org_name", "current_value", "comparison_value", "change_value"},
-        "growth": {"org_name", "current_value", "comparison_value", "growth_rate"},
-        "ratio": {"org_name", "derived_value"},
-        "province_average_compare": {
-            "org_name", "metric_value", "province_average", "difference_from_average"
-        },
-        "threshold": {"org_name", "metric_value", "threshold_met"},
-        "daily_average": {"org_name", "average_value"},
-        "quarterly_trend": {"org_name", "data_date", "metric_value"},
-        "sum": {"metric_name", "metric_value", "total_value"},
-        "composition": {"metric_name", "derived_value"},
-        "mom_yoy": {"org_name", "current_value", "mom_change", "yoy_change"},
-        "count_vs_average": (
-            {"matching_days", "total_days", "matching_percentage"}
-            if plan.start_date else {"matching_organizations", "total_organizations"}
-        ),
-        "count_condition": {"matching_organizations", "total_organizations"},
-        "profile": {"org_name", "metric_id", "metric_name", "metric_value", "metric_rank"},
-        "cross_difference": {"metric_name", "metric_value", "difference_value"},
-        "period_rank_extremes": {"org_name", "average_value", "rank_type", "metric_rank"},
-        "period_extrema": {"org_name", "data_date", "metric_value", "extrema_type"},
-        "multi_period_change": {"metric_name", "comparison_value", "current_value", "change_value"},
-        "multi_rank_change": {
-            "metric_name", "comparison_value", "current_value", "previous_rank", "current_rank"
-        },
-        "period_change_rank": {"org_name", "result_value", "result_rank"},
-        "multi_rank": {"metric_name", "metric_value", "metric_rank"},
-        "three_dimension_profile": {"metric_id", "metric_name", "metric_value", "metric_rank"},
-        "reconcile": {"corporate_value", "personal_value", "total_value", "difference_value", "is_equal"},
-        "multi_metric_province_compare": {
-            "org_name", "metric_id", "metric_name", "metric_value", "province_average"
-        },
-    }.get(plan.operation)
+    required_columns = _REQUIRED_COLUMNS_BY_OPERATION.get(plan.operation)
+    if plan.operation == "count_vs_average" and plan.start_date:
+        required_columns = {"matching_days", "total_days", "matching_percentage"}
     if required_columns and any(not required_columns.issubset(row) for row in rows):
         return _generic_answer(plan, rows, catalog)
-    if plan.operation not in {
-        "value", "rank", "difference", "growth", "ratio",
-        "province_average_compare", "threshold", "daily_average", "quarterly_trend",
-        "sum", "composition", "mom_yoy", "count_vs_average", "profile",
-        "cross_difference", "period_rank_extremes", "period_extrema",
-        "multi_period_change", "period_change_rank", "multi_rank",
-        "three_dimension_profile", "reconcile",
-        "multi_metric_province_compare",
-        "count_condition", "multi_rank_change",
-    }:
+    if plan.operation not in _RULE_ANSWER_OPERATIONS:
         return _generic_answer(plan, rows, catalog)
     if plan.operation == "multi_metric_province_compare":
         relation_by_metric = {
@@ -329,7 +366,7 @@ def _format_answer_core(plan: QueryPlan, result: QueryResult, catalog: SemanticC
             for org_name, values in organizations.items()
         )
         if "require_organization_count" in plan.assumptions:
-            answer += f"；共{len(organizations)}家"
+            answer = f"共有{len(organizations)}家，分别为：{answer}"
         return answer
     if plan.operation == "sum":
         pieces = []
@@ -576,6 +613,12 @@ def _format_answer_core(plan: QueryPlan, result: QueryResult, catalog: SemanticC
         )
     if plan.operation == "difference":
         pieces = []
+        current_value_first = _value_requested_before_change(question)
+        metric_name = (
+            catalog.metrics[plan.metrics[0]].name
+            if len(plan.metrics) == 1 and plan.metrics[0] in catalog.metrics
+            else "当前值"
+        )
         for row in rows:
             if row.get("current_value") is None or row.get("comparison_value") is None or row.get("change_value") is None:
                 missing = "当前期" if row.get("current_value") is None else "比较期"
@@ -584,11 +627,19 @@ def _format_answer_core(plan: QueryPlan, result: QueryResult, catalog: SemanticC
             change = float(row["change_value"])
             direction = "增加" if change > 0 else "下降" if change < 0 else "持平"
             change_unit = "个百分点" if plan.metrics[0] in RATIO_METRICS else str(row.get("unit") or unit)
-            pieces.append(
-                f"{row['org_name']}：{direction}{_number(abs(change))}{change_unit}"
-                f"（当前{_value(row['current_value'], str(row.get('unit') or unit))}，"
-                f"比较期{_value(row['comparison_value'], str(row.get('unit') or unit))}）"
-            )
+            if current_value_first:
+                pieces.append(
+                    f"{row['org_name']}：{metric_name}"
+                    f"{_value(row['current_value'], str(row.get('unit') or unit))}；"
+                    f"{direction}{_number(abs(change))}{change_unit}"
+                    f"（比较期{_value(row['comparison_value'], str(row.get('unit') or unit))}）"
+                )
+            else:
+                pieces.append(
+                    f"{row['org_name']}：{direction}{_number(abs(change))}{change_unit}"
+                    f"（当前{_value(row['current_value'], str(row.get('unit') or unit))}，"
+                    f"比较期{_value(row['comparison_value'], str(row.get('unit') or unit))}）"
+                )
         return "；".join(pieces)
     if plan.operation == "growth":
         pieces = []
@@ -792,7 +843,7 @@ def format_answer(
     question: str = "",
     history: tuple[TurnMemory, ...] = (),
 ) -> str:
-    answer = _format_answer_core(plan, result, catalog)
+    answer = _format_answer_core(plan, result, catalog, question)
     facts = _collect_metric_facts(plan, result, history, catalog)
     if re.search(r"达标|监管(?:线|要求|标准|上限)", question) and len(plan.metrics) == 1:
         thresholds = {"ZB013": ("低于", 5.0, "上限"), "ZB015": ("不低于", 150.0, "要求"), "ZB016": ("不低于", 10.5, "要求")}

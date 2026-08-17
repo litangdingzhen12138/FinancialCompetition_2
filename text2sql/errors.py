@@ -19,6 +19,14 @@ class PlanningError(Text2SQLError):
     pass
 
 
+class ClarificationError(Text2SQLError):
+    """The request cannot be resolved uniquely without another user turn."""
+
+
+class FinalAnswerError(Text2SQLError):
+    pass
+
+
 class ValidationError(Text2SQLError):
     pass
 
@@ -41,4 +49,3 @@ def retry_feedback(exc: Exception) -> str:
     if isinstance(exc, QueryExecutionError) and exc.retry_feedback:
         return exc.retry_feedback
     return str(exc)[:500]
-

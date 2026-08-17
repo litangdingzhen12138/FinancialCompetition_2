@@ -200,7 +200,7 @@ def test_rank_question_focuses_on_the_metric_nearest_the_rank_request(service):
     assert decision.plan.organizations == ("ORG010",)
 
 
-def test_profit_deposit_ratio_uses_compatible_units(service):
+def test_profit_deposit_ratio_uses_competition_workbook_convention(service):
     response = service.ask(
         "L市2026年4月末的净利润/存款比约为多少？",
         "profit-deposit-ratio",
@@ -208,7 +208,7 @@ def test_profit_deposit_ratio_uses_compatible_units(service):
 
     assert response.route == "rule"
     assert response.plan["derived_formula"] == "profit_deposit_ratio"
-    assert "0.0232%" in response.answer
+    assert "232.12%" in response.answer
 
 
 def test_two_explicit_dates_are_remembered_for_the_next_subject(service):
@@ -586,6 +586,33 @@ def test_joint_metric_province_average_conditions_are_local_and_readable(service
     assert "江苏省A市农商行：不良贷款率0.92%（低于全省均值1.14%）" in response.answer
     assert "拨备覆盖率202.47%（高于全省均值178.52%）" in response.answer
     assert response.answer.count("农商行：") == 6
+
+
+def test_joint_metric_condition_count_is_answered_before_organization_details(service):
+    response = service.ask(
+        "2026年4月末同时满足不良率低于全省均值且拨备覆盖率高于全省均值的共有几家？",
+        "joint-province-average-count-first",
+    )
+
+    assert response.route == "rule"
+    assert response.answer.startswith("共有6家，分别为：江苏省A市农商行")
+    assert response.answer.count("农商行：") == 6
+    assert not response.answer.endswith("共6家")
+
+
+def test_value_then_change_question_is_answered_in_the_same_order(service):
+    session_id = "value-before-change"
+    service.ask("江苏省J市农商行2024年末的净利润是多少？", session_id)
+
+    response = service.ask(
+        "2025年三季度末净利润是多少？比二季度末增长了多少？",
+        session_id,
+    )
+
+    assert response.answer == (
+        "江苏省J市农商行：净利润175.6万元；"
+        "增加25.34万元（比较期150.26万元）"
+    )
 
 
 def test_multi_metric_values_keep_metric_names(service):

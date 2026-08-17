@@ -36,6 +36,106 @@ EXTERNAL_ACCESS = re.compile(
 )
 
 
+ANSWER_OBLIGATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("rank", re.compile(r"第几|排名|排第|位列|前\d|后\d|前三|后三|哪家.*(?:最高|最低|最多|最少)|谁.*(?:最高|最低)")),
+    ("province_average", re.compile(r"全省(?:均值|平均)|省均值|平均水平")),
+    ("growth", re.compile(r"增幅|增长率|增长百分比")),
+    ("difference", re.compile(r"差多少|相差|变化了多少|变动了多少|增减了多少|增长了多少钱|回落了多少|高多少|低多少|多多少|少多少")),
+    ("threshold", re.compile(r"达标|监管(?:线|要求|上限|下限)|满足.*要求|是否.*(?:高于|低于|达到|超过|不超过).*\d+(?:\.\d+)?%?")),
+    ("count", re.compile(r"多少家|有几家|一共有几家|多少天")),
+    ("profile", re.compile(r"综合(?:评价|判断|来看)|整体(?:画像|风控|风险)|画像|一句话总结|最优.*之一")),
+    ("extrema", re.compile(r"最高日|最低日|单日最高|单日最低|最高.*最低|最低.*最高")),
+    ("trend", re.compile(r"逐季(?:变化|趋势|数据|如何|怎么样|是)|按季(?:展示|列出|分析)|季度(?:序列|趋势)|趋势")),
+    ("sum", re.compile(r"合计|总额|加起来|相加|总和")),
+)
+
+
+def answer_obligations(question: str) -> tuple[str, ...]:
+    """Extract only high-confidence semantic duties; unknown wording stays with LLM."""
+    normalized = re.sub(r"\s+", "", question)
+    obligations = [
+        name for name, pattern in ANSWER_OBLIGATION_PATTERNS if pattern.search(normalized)
+    ]
+    if (
+        "extrema" in obligations
+        and "rank" in obligations
+        and not re.search(r"第几|排名|排第|位列|前\d|后\d|前三|后三", normalized)
+    ):
+        obligations.remove("rank")
+    return tuple(dict.fromkeys(obligations))
+
+
+class AnswerCoverageValidator:
+    """Reject plans that complete only a visible subset of the user's request."""
+
+    _RANK_OPERATIONS = {
+        "rank", "period_change_rank", "multi_rank", "multi_rank_change",
+        "period_rank_extremes", "profile", "three_dimension_profile",
+    }
+    _AVERAGE_OPERATIONS = {
+        "province_average_compare", "count_vs_average", "multi_metric_province_compare",
+    }
+    _DIFFERENCE_OPERATIONS = {
+        "difference", "growth", "province_average_compare", "cross_difference",
+        "mom_yoy", "multi_period_change", "period_change_rank", "multi_rank_change",
+    }
+    _THRESHOLD_OPERATIONS = {
+        "threshold", "count_condition", "multi_metric_province_compare",
+    }
+    _COUNT_OPERATIONS = {
+        "count_condition", "count_vs_average", "multi_metric_province_compare",
+    }
+    _PROFILE_OPERATIONS = {"profile", "three_dimension_profile"}
+    _EXTREMA_OPERATIONS = {"extrema", "period_extrema", "period_rank_extremes"}
+
+    def analyze(self, question: str, plan: QueryPlan) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        required = answer_obligations(question)
+        supported = {"value"}
+        operation = plan.operation
+
+        if operation == "multi_condition":
+            # The LLM uses this operation for genuinely composite plans; SQL and
+            # result validation remain responsible for its concrete columns.
+            supported.update(required)
+        if operation in self._RANK_OPERATIONS or "rank_population_all" in plan.assumptions:
+            supported.add("rank")
+        if operation in self._AVERAGE_OPERATIONS:
+            supported.add("province_average")
+        if operation in self._DIFFERENCE_OPERATIONS or plan.query_type in {
+            "pairwise_difference", "cross_difference"
+        }:
+            supported.add("difference")
+        if operation == "growth" or (
+            operation == "period_change_rank"
+            and "rank_decrease" not in plan.assumptions
+            and "rank_absolute_change" not in plan.assumptions
+        ):
+            supported.add("growth")
+        if operation in self._THRESHOLD_OPERATIONS or "regulatory_check" in plan.assumptions:
+            supported.add("threshold")
+        if operation in self._COUNT_OPERATIONS or "require_organization_count" in plan.assumptions:
+            supported.add("count")
+        if operation in self._PROFILE_OPERATIONS or "needs_summary" in plan.assumptions:
+            supported.add("profile")
+        if operation in self._EXTREMA_OPERATIONS or "include_extrema" in plan.assumptions:
+            supported.add("extrema")
+        if operation == "quarterly_trend":
+            supported.add("trend")
+        if operation in {"sum", "reconcile", "composition"}:
+            supported.add("sum")
+
+        missing = tuple(item for item in required if item not in supported)
+        return required, missing
+
+    def validate(self, question: str, plan: QueryPlan) -> None:
+        required, missing = self.analyze(question, plan)
+        if missing:
+            raise ValidationError(
+                "查询计划未覆盖全部回答义务："
+                f"要求={','.join(required) or 'value'}；遗漏={','.join(missing)}"
+            )
+
+
 def _is_zero_literal(node: exp.Expression) -> bool:
     return isinstance(node, exp.Literal) and node.is_number and float(node.this) == 0.0
 

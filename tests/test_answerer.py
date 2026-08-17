@@ -108,13 +108,13 @@ def test_generic_multi_calculation_rows_are_rendered_as_natural_facts(service):
         columns=("org_name", "metric_name", "result_value", "unit"),
         rows=(
             ("江苏省C市农商行", "净利润回落额", 7.9, "万元"),
-            ("江苏省C市农商行", "净利润/存款比", 0.024173, "%"),
+            ("江苏省C市农商行", "净利润/存款比", 241.73, "%"),
         ),
     )
 
     answer = format_answer(plan, result, service.catalog)
 
-    assert answer == "江苏省C市农商行：净利润回落额为7.9万元；净利润/存款比为0.0242%"
+    assert answer == "江苏省C市农商行：净利润回落额为7.9万元；净利润/存款比为241.73%"
 
 
 def test_wide_condition_answer_accepts_semantic_column_aliases(service):
@@ -140,4 +140,31 @@ def test_wide_condition_answer_accepts_semantic_column_aliases(service):
 
     assert "不良贷款率0.85%" in answer
     assert "成本收入比28.37%" in answer
+    assert "综合判定：同时满足全部四项条件" in answer
+
+
+def test_wide_condition_answer_accepts_all_conditions_met_alias(service):
+    plan = QueryPlan(
+        source="llm",
+        query_type="joint_condition",
+        operation="multi_condition",
+        organizations=("ORG012",),
+        organization_scope="selected",
+        metrics=("ZB013", "ZB015", "ZB016", "ZB012"),
+        current_date="2026-04-30",
+    )
+    result = QueryResult(
+        columns=(
+            "z_b013_value", "z_b013_province_avg", "z_b015_value",
+            "z_b015_province_avg", "z_b016_value", "z_b012_value",
+            "z_b012_province_avg", "all_conditions_met",
+        ),
+        rows=((0.85, 1.14, 197.87, 178.5, 12.11, 28.37, 32.11, 1),),
+    )
+
+    answer = format_answer(plan, result, service.catalog)
+
+    assert "不良贷款率0.85%" in answer
+    assert "成本收入比28.37%" in answer
+    assert "all_conditions_met" not in answer
     assert "综合判定：同时满足全部四项条件" in answer

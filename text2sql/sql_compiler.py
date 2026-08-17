@@ -5,7 +5,7 @@ from __future__ import annotations
 from .business_rules import PERFORMANCE_BAD_COUNT, PERFORMANCE_GOOD_MAX_RANK
 from .models import QueryPlan
 from .date_resolver import same_period_last_year
-from .semantic_catalog import COMPOSITION_METRICS, LOWER_IS_BETTER
+from .semantic_catalog import COMPOSITION_METRICS, DERIVED_METRICS, LOWER_IS_BETTER
 
 
 def _literals(values: tuple[str, ...]) -> str:
@@ -133,11 +133,8 @@ def _period_sql(plan: QueryPlan) -> str:
 
 def _ratio_sql(plan: QueryPlan) -> str:
     numerator, denominator = plan.metrics
-    multiplier = {
-        "profit_per_employee": "1.0",
-        "deposit_per_branch": "10000.0",
-        "profit_deposit_ratio": "0.01",
-    }.get(plan.derived_formula, "100.0")
+    definition = DERIVED_METRICS.get(plan.derived_formula or "", {})
+    multiplier = str(definition.get("multiplier", "100.0"))
     return f"""
         WITH components AS (
             SELECT v.org_id,

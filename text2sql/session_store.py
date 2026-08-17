@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from threading import RLock
 
-from .models import QueryPlan, QueryResult, SessionState, TurnMemory
+from .models import PendingQuery, QueryPlan, QueryResult, SessionState, TurnMemory
 
 
 class InMemorySessionStore:
@@ -46,7 +46,21 @@ class InMemorySessionStore:
                     *previous.recent_turns,
                     TurnMemory(question=question, plan=plan, result=result, answer=answer),
                 )[-20:],
+                pending_query=None,
             )
+
+    def set_pending(self, session_id: str, pending_query: PendingQuery) -> None:
+        """Store an incomplete query without disturbing the successful focus state."""
+        with self._lock:
+            state = deepcopy(self._states.get(session_id, SessionState()))
+            state.pending_query = pending_query
+            self._states[session_id] = state
+
+    def clear_pending(self, session_id: str) -> None:
+        with self._lock:
+            state = self._states.get(session_id)
+            if state is not None:
+                state.pending_query = None
 
     def clear(self, session_id: str) -> None:
         with self._lock:
