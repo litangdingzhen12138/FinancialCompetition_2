@@ -39,6 +39,35 @@ body {
   background-size: 32px 32px;
 }
 
+.auth-restore-screen {
+  display: grid;
+  min-height: 100vh;
+  place-content: center;
+  justify-items: center;
+  gap: 12px;
+  color: var(--navy);
+}
+
+.auth-restore-mark {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border-radius: 12px 4px 12px 4px;
+  color: #fff;
+  background: linear-gradient(145deg, var(--emerald), var(--gold));
+  box-shadow: 0 12px 30px rgba(15, 123, 104, 0.16);
+  font-family: "STSong", "Songti SC", serif;
+  font-size: 22px;
+  font-weight: 800;
+}
+
+.auth-restore-screen p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .login-page {
   display: grid;
   min-height: 100vh;

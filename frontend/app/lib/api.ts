@@ -29,6 +29,10 @@ function rememberAuthUser(user: AuthUser | null): void {
   else window.localStorage.removeItem(AUTH_USER_KEY);
 }
 
+export function getRememberedAuthUser(): AuthUser | null {
+  return cachedAuthUser;
+}
+
 export function getCachedAuthUser(): AuthUser {
   if (cachedAuthUser) return cachedAuthUser;
   if (typeof window !== "undefined") {

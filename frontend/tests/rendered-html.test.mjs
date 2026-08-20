@@ -25,17 +25,15 @@ async function render(pathname = "/") {
   );
 }
 
-test("server-renders the product login", async () => {
+test("restores authentication without server-rendering the login form", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
   assert.match(html, /<title>智能问数 · 数衡 BankInsight<\/title>/i);
-  assert.match(html, /登录数衡/);
-  assert.match(html, /请输入账号/);
-  assert.match(html, /请输入密码/);
-  assert.match(html, /analyst123/);
+  assert.match(html, /正在进入工作空间/);
+  assert.doesNotMatch(html, /登录数衡|请输入账号|请输入密码/);
   assert.match(html, /og\.png/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
 });
@@ -50,6 +48,8 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
     packageJson,
     workbench,
     appShell,
+    loginView,
+    api,
     queryResult,
     adminView,
     historyView,
@@ -62,6 +62,8 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../app/components/Workbench.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/LoginView.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/api.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/components/QueryResult.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/components/AdminView.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/components/HistoryView.tsx", import.meta.url), "utf8"),
@@ -84,6 +86,10 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
   assert.match(workbench, /从一句业务问题，到一份/);
   assert.match(appShell, /handleLogout/);
   assert.match(appShell, /LoginView/);
+  assert.match(appShell, /useState<AuthUser \| null>\(getRememberedAuthUser\)/);
+  assert.match(api, /getRememberedAuthUser/);
+  assert.match(loginView, /正在进入工作空间/);
+  assert.match(loginView, /登录数衡/);
   assert.ok(
     queryResult.indexOf("最终回答") < queryResult.indexOf("chart-card"),
     "最终回答应显示在图表分析之前",

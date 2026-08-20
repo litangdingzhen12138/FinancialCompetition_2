@@ -3,7 +3,12 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
-import { getCurrentUser, logout, type AuthUser } from "../lib/api";
+import {
+  getCurrentUser,
+  getRememberedAuthUser,
+  logout,
+  type AuthUser,
+} from "../lib/api";
 import { LoginView } from "./LoginView";
 
 const navigation = [
@@ -14,7 +19,7 @@ const navigation = [
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const [user, setUser] = useState<AuthUser | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(getRememberedAuthUser);
   const [checking, setChecking] = useState(true);
   const [loggingOut, setLoggingOut] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(false);

@@ -29,6 +29,15 @@ export function LoginView({
     }
   }
 
+  if (checking) {
+    return (
+      <main className="auth-restore-screen" role="status" aria-live="polite">
+        <span className="auth-restore-mark" aria-hidden="true">衡</span>
+        <p>正在进入工作空间…</p>
+      </main>
+    );
+  }
+
   return (
     <main className="login-page">
       <section className="login-visual" aria-label="数衡智能问数">
