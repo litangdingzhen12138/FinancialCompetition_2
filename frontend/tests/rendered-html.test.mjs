@@ -43,6 +43,9 @@ test("server-renders the product login", async () => {
 test("keeps the workbench, conversation sidebar and product metadata", async () => {
   const [
     page,
+    workspaceLayout,
+    adminPage,
+    historyPage,
     layout,
     packageJson,
     workbench,
@@ -51,7 +54,10 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
     adminView,
     historyView,
   ] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/(workspace)/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/(workspace)/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/(workspace)/admin/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/(workspace)/history/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../app/components/Workbench.tsx", import.meta.url), "utf8"),
@@ -62,6 +68,10 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
   ]);
 
   assert.match(page, /<Workbench \/>/);
+  assert.match(workspaceLayout, /<AppShell>\{children\}<\/AppShell>/);
+  assert.doesNotMatch(page, /AppShell/);
+  assert.doesNotMatch(adminPage, /AppShell/);
+  assert.doesNotMatch(historyPage, /AppShell/);
   assert.match(layout, /数衡 BankInsight/);
   assert.match(layout, /\/og\.png/);
   assert.match(workbench, /conversation-sidebar/);

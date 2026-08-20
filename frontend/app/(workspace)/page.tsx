@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
-import { AppShell } from "./components/AppShell";
-import { Workbench } from "./components/Workbench";
+import { Workbench } from "../components/Workbench";
 
 export const metadata: Metadata = {
   title: "智能问数",
@@ -8,9 +7,5 @@ export const metadata: Metadata = {
 };
 
 export default function Home() {
-  return (
-    <AppShell>
-      <Workbench />
-    </AppShell>
-  );
+  return <Workbench />;
 }
