@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 import re
 import time
 from typing import Any, Iterator
 import uuid
+from threading import Lock
 
 from .chart_recommender import ChartRecommender
 from .final_answer import FinalAnswerGenerator
-from .models import PendingQuery, QueryResult
+from .models import DataAccessScope, PendingQuery, QueryResult
 from .product_models import (
     ChartSpec,
     DataColumn,
@@ -26,6 +27,27 @@ from .service import Text2SQLService
 
 API_VERSION = "v1"
 SENSITIVE_METRICS = {"ZB013", "ZB014", "ZB015", "ZB016", "ZB017"}
+CROSS_ORGANIZATION_OPERATIONS = {
+    "rank",
+    "province_average_compare",
+    "multi_condition",
+    "count_vs_average",
+    "profile",
+    "period_rank_extremes",
+    "period_change_rank",
+    "multi_rank",
+    "multi_rank_change",
+    "three_dimension_profile",
+    "multi_metric_province_compare",
+}
+ALERT_S3_FREQUENCY = "S3_QUERY_FREQUENCY"
+ALERT_ACCESS_DENIED = "REPEATED_ACCESS_DENIED"
+ALERT_LARGE_EXPORT = "LARGE_EXPORT"
+ALERT_DAILY_EXPORT = "DAILY_EXPORT_VOLUME"
+ALERT_OFF_HOURS_EXPORT = "OFF_HOURS_S3_EXPORT"
+ALERT_SHARE_FREQUENCY = "SHARE_LINK_FREQUENCY"
+ALERT_MULTI_METRIC = "MULTI_METRIC_QUERY"
+SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 FINAL_ANSWER_FALLBACK_WARNING = (
     "最终回答模型调用失败，已返回基于查询结果生成的降级答案。"
 )
@@ -64,6 +86,19 @@ NEXT_TIME_LEVEL: dict[TimeGranularity, TimeGranularity | None] = {
 }
 
 
+class AccountFrozenError(PermissionError):
+    def __init__(self, frozen_until: str, reason: str) -> None:
+        super().__init__(f"账号因异常访问已临时冻结至 {frozen_until}：{reason}")
+        self.frozen_until = frozen_until
+        self.reason = reason
+
+
+class LargeExportConfirmationRequired(ValueError):
+    def __init__(self, row_count: int) -> None:
+        super().__init__(f"本次导出共{row_count}行，超过200行，需要确认")
+        self.row_count = row_count
+
+
 class ProductQueryService:
     def __init__(
         self,
@@ -75,6 +110,7 @@ class ProductQueryService:
         self.store = store or ProductStore(core.settings.product_db_path)
         self.charts = ChartRecommender(core.catalog)
         self.final_answers = final_answers or FinalAnswerGenerator(core.settings)
+        self._security_lock = Lock()
 
     def query(
         self,
@@ -84,21 +120,34 @@ class ProductQueryService:
     ) -> ProductQueryResponse:
         public_session_id = session_id or uuid.uuid4().hex
         internal_session_id = self._internal_session_id(public_session_id, user)
-        self._authorize_question(question, user)
-        self._restore_pending_session(
-            internal_session_id,
-            public_session_id,
-            user,
-        )
         started = time.perf_counter()
         query_id = uuid.uuid4().hex
+        self._audit(
+            user,
+            "query.requested",
+            "low",
+            {"question": question, "session_id": public_session_id},
+            query_id,
+        )
         try:
+            self._ensure_not_frozen(user)
+            if not user.can_query_data:
+                raise PermissionError("当前业务角色无数据查询权限")
+            self._authorize_question(question, user)
+            self._restore_pending_session(
+                internal_session_id,
+                public_session_id,
+                user,
+            )
             response = self.core.ask(
                 question,
                 internal_session_id,
+                plan_authorizer=lambda plan: self._authorize_plan(
+                    plan.to_dict(),
+                    user,
+                ),
             )
             self.store.clear_pending_session(user.user_id, public_session_id)
-            self._authorize_plan(response.plan, user)
             result = QueryResult(response.columns, response.rows)
             primary, alternatives = self.charts.recommend(response.plan, result)
             answer_mode = response.answer_mode
@@ -141,18 +190,50 @@ class ProductQueryService:
                 "created_at": generated_at,
             }
             self.store.save_query(raw_record)
-            self._audit(
+            metrics = sorted(set(response.plan.get("metrics") or ()))
+            event_id = self._audit(
                 user,
                 "query.completed",
                 "low",
-                {"question": question, "route": response.route, "row_count": len(response.rows)},
+                {
+                    "question": question,
+                    "route": response.route,
+                    "row_count": len(response.rows),
+                    "metrics": metrics,
+                    "metric_count": len(metrics),
+                    "organizations": list(response.plan.get("organizations") or ()),
+                    "data_level": self._data_level(metrics),
+                    "plan": response.plan,
+                    "sql": response.sql,
+                },
                 query_id,
+            )
+            self._evaluate_query_alerts(
+                user,
+                event_id=event_id,
+                query_id=query_id,
+                metrics=metrics,
             )
             return self._response_from_record(
                 raw_record,
                 user,
                 alternatives=alternatives,
             )
+        except AccountFrozenError:
+            raise
+        except PermissionError as exc:
+            self._persist_pending_session(
+                internal_session_id,
+                public_session_id,
+                user,
+            )
+            self._record_access_denied(
+                user,
+                question=question,
+                reason=str(exc),
+                query_id=query_id,
+            )
+            raise
         except Exception as exc:
             self._persist_pending_session(
                 internal_session_id,
@@ -208,18 +289,29 @@ class ProductQueryService:
         period_start: str | None = None,
         period_end: str | None = None,
     ) -> ProductQueryResponse:
+        self._ensure_not_frozen(user)
+        if not user.can_query_data:
+            reason = "当前业务角色无数据查询权限"
+            self._record_access_denied(
+                user,
+                question="时间下钻",
+                reason=reason,
+                query_id=source_query_id,
+            )
+            raise PermissionError(reason)
         source = self._owned_query(source_query_id, user)
         plan = source["plan"]
         metrics = tuple(plan.get("metrics") or ())
         organizations = tuple(plan.get("organizations") or ())
         if len(metrics) != 1 or len(organizations) != 1:
             raise ValueError("时间下钻当前要求原查询只包含一个指标和一个机构")
-        self._authorize_plan(plan, user)
+        access_scope = self._authorize_plan(plan, user)
         start_date, end_date = self._drill_range(
             target,
             plan.get("current_date"),
             period_start,
             period_end,
+            access_scope,
         )
         metric_id = self._safe_identifier(metrics[0], "指标")
         org_id = self._safe_identifier(organizations[0], "机构")
@@ -231,8 +323,8 @@ class ProductQueryService:
             end_date,
         )
         approved_sql, _ = self.core.sql_guard.validate_and_limit(sql)
-        self.core.executor.preflight(approved_sql)
-        result = self.core.executor.execute(approved_sql)
+        self.core.executor.preflight(approved_sql, access_scope)
+        result = self.core.executor.execute(approved_sql, access_scope)
         query_id = uuid.uuid4().hex
         metric_name = self.core.catalog.metrics[metric_id].name
         organization_name = self.core.catalog.organizations[org_id]
@@ -305,12 +397,26 @@ class ProductQueryService:
             "created_at": generated_at,
         }
         self.store.save_query(record)
-        self._audit(
+        event_id = self._audit(
             user,
             "query.time_drill",
             "low",
-            {"source_query_id": source_query_id, "target": target},
+            {
+                "source_query_id": source_query_id,
+                "target": target,
+                "metrics": [metric_id],
+                "organizations": [org_id],
+                "row_count": result.row_count,
+                "data_level": self._data_level([metric_id]),
+                "sql": approved_sql,
+            },
             query_id,
+        )
+        self._evaluate_query_alerts(
+            user,
+            event_id=event_id,
+            query_id=query_id,
+            metrics=[metric_id],
         )
         return self._response_from_record(record, user)
 
@@ -321,9 +427,12 @@ class ProductQueryService:
         limit: int | None = None,
         keyword: str | None = None,
     ) -> list[dict[str, Any]]:
-        owner = None if user.can_view_admin else user.user_id
+        self._ensure_not_frozen(user)
+        owner = None if user.can_view_all_queries else user.user_id
         titles = self.store.list_session_titles(owner)
-        return [
+        records = self.store.list_queries(owner, limit=limit, keyword=keyword)
+        visible_records = self._visible_history_records(records, user)
+        items = [
             {
                 "query_id": record["query_id"],
                 "session_id": record["session_id"],
@@ -332,9 +441,8 @@ class ProductQueryService:
                 "route": record["route"],
                 "status": record["status"],
                 "answer": (
-                    "敏感指标具体数值已按权限隐藏"
-                    if user.mask_sensitive_values
-                    and self._contains_sensitive_metric(record["plan"])
+                    "查询结果数值已按权限隐藏"
+                    if self._should_mask_values(user, record["plan"])
                     else (
                         "最终回答生成中"
                         if record.get("answer_status") in {"pending", "streaming"}
@@ -350,8 +458,19 @@ class ProductQueryService:
                     (str(record["user_id"]), str(record["session_id"]))
                 ),
             }
-            for record in self.store.list_queries(owner, limit=limit, keyword=keyword)
+            for record in visible_records
         ]
+        self._audit(
+            user,
+            "history.viewed",
+            "low",
+            {
+                "record_count": len(items),
+                "hidden_by_current_permissions": len(records) - len(visible_records),
+                "keyword": keyword,
+            },
+        )
+        return items
 
     def session_history(
         self,
@@ -360,10 +479,11 @@ class ProductQueryService:
         *,
         owner_user_id: str | None = None,
     ) -> list[ProductQueryResponse]:
+        self._ensure_not_frozen(user)
         owner = (
             owner_user_id
-            if user.can_view_admin and owner_user_id
-            else (None if user.can_view_admin else user.user_id)
+            if user.can_view_all_queries and owner_user_id
+            else (None if user.can_view_all_queries else user.user_id)
         )
         records = self.store.list_queries(
             owner,
@@ -371,7 +491,10 @@ class ProductQueryService:
             session_id=session_id,
             oldest_first=True,
         )
-        return [self._response_from_record(record, user) for record in records]
+        visible_records = self._visible_history_records(records, user)
+        return [
+            self._response_from_record(record, user) for record in visible_records
+        ]
 
     def rename_session(
         self,
@@ -381,12 +504,13 @@ class ProductQueryService:
         *,
         owner_user_id: str | None = None,
     ) -> dict[str, str]:
+        self._ensure_not_frozen(user)
         normalized = " ".join(title.split()).strip()
         if not normalized:
             raise ValueError("会话名称不能为空")
         target_user_id = (
             owner_user_id
-            if user.can_view_admin and owner_user_id
+            if user.can_view_all_queries and owner_user_id
             else user.user_id
         )
         self.store.set_session_title(target_user_id, session_id, normalized[:60])
@@ -404,33 +528,74 @@ class ProductQueryService:
         recent_count: int = 20,
         session_id: str | None = None,
         owner_user_id: str | None = None,
+        confirm_large_export: bool = False,
     ) -> list[dict[str, Any]]:
+        self._ensure_not_frozen(user)
         if not user.can_export:
-            raise PermissionError("当前角色无导出权限")
+            reason = "当前角色无导出权限"
+            self._record_access_denied(
+                user,
+                question="批量导出历史记录",
+                reason=reason,
+                query_id=None,
+            )
+            raise PermissionError(reason)
         if scope not in {"all", "recent", "session"}:
             raise ValueError("不支持的批量导出范围")
         if scope == "session" and not session_id:
             raise ValueError("按会话导出时必须选择 thread_id")
-        owner = owner_user_id if user.can_view_admin else user.user_id
+        owner = owner_user_id if user.can_view_all_queries else user.user_id
         records = self.store.list_queries(
             owner,
             limit=max(1, min(recent_count, 5000)) if scope == "recent" else None,
             session_id=session_id if scope == "session" else None,
         )
-        self._audit(
+        try:
+            for record in records:
+                self._authorize_plan(record["plan"], user)
+        except PermissionError as exc:
+            self._record_access_denied(
+                user,
+                question="批量导出历史记录",
+                reason=str(exc),
+                query_id=None,
+            )
+            raise
+        exported_rows = sum(len(record["rows"]) for record in records)
+        if exported_rows > 200 and not confirm_large_export:
+            raise LargeExportConfirmationRequired(exported_rows)
+        metrics = sorted(
+            {
+                str(metric)
+                for record in records
+                for metric in record["plan"].get("metrics") or ()
+            }
+        )
+        event_id = self._audit(
             user,
             "history.batch_exported",
-            "medium",
+            "low",
             {
                 "scope": scope,
                 "record_count": len(records),
+                "exported_rows": exported_rows,
                 "session_id": session_id,
                 "owner_user_id": owner,
+                "metrics": metrics,
+                "data_level": self._data_level(metrics),
             },
         )
-        return records
+        self._evaluate_export_alerts(
+            user,
+            event_id=event_id,
+            query_id=None,
+            exported_rows=exported_rows,
+            metrics=metrics,
+        )
+        return [self._sanitize_record_for_user(record, user) for record in records]
 
     def get_query(self, query_id: str, user: UserContext) -> ProductQueryResponse:
+        self._ensure_not_frozen(user)
         return self._response_from_record(self._owned_query(query_id, user), user)
 
     def stream_final_answer(
@@ -438,11 +603,12 @@ class ProductQueryService:
         query_id: str,
         user: UserContext,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
+        self._ensure_not_frozen(user)
         record = self._owned_query(query_id, user)
         mode = str(record.get("answer_mode") or "rule")
         yield "answer_start", {"query_id": query_id, "mode": mode}
 
-        if user.mask_sensitive_values and self._contains_sensitive_metric(record["plan"]):
+        if self._should_mask_values(user, record["plan"]):
             insight = Insight(
                 headline="最终回答",
                 summary="敏感指标具体数值已按当前角色权限隐藏。",
@@ -577,8 +743,16 @@ class ProductQueryService:
         *,
         expires_hours: int,
     ) -> dict[str, str]:
+        self._ensure_not_frozen(user)
         if not user.can_share:
-            raise PermissionError("当前角色无分享权限")
+            reason = "当前角色无分享权限"
+            self._record_access_denied(
+                user,
+                question="创建分享链接",
+                reason=reason,
+                query_id=query_id,
+            )
+            raise PermissionError(reason)
         self._owned_query(query_id, user)
         share_id = uuid.uuid4().hex
         expires_at = (
@@ -590,23 +764,54 @@ class ProductQueryService:
             user_id=user.user_id,
             expires_at=expires_at,
         )
-        self._audit(
+        event_id = self._audit(
             user,
             "query.shared",
-            "medium",
+            "low",
             {"share_id": share_id, "expires_at": expires_at},
             query_id,
+        )
+        self._evaluate_share_alerts(
+            user,
+            event_id=event_id,
+            query_id=query_id,
         )
         return {"share_id": share_id, "token": token, "expires_at": expires_at}
 
     def resolve_share(self, token: str, user: UserContext) -> ProductQueryResponse:
+        self._ensure_not_frozen(user)
         share = self.store.resolve_share(token)
         if not share:
             raise ValueError("分享链接无效、已撤销或已过期")
+        creator_freeze = self.store.get_active_freeze(
+            str(share["created_by"]),
+            now=self._now_datetime(),
+        )
+        if creator_freeze:
+            self._audit(
+                user,
+                "share.access_denied",
+                "medium",
+                {
+                    "share_id": share["share_id"],
+                    "reason": "creator_frozen",
+                },
+                str(share["query_id"]),
+            )
+            raise PermissionError("分享创建者账号已冻结，当前分享暂不可访问")
         record = self.store.get_query(str(share["query_id"]))
         if not record:
             raise ValueError("分享的查询记录不存在")
-        self._authorize_plan(record["plan"], user)
+        try:
+            self._authorize_plan(record["plan"], user)
+        except PermissionError as exc:
+            self._record_access_denied(
+                user,
+                question="访问分享查询结果",
+                reason=str(exc),
+                query_id=str(record["query_id"]),
+            )
+            raise
         self._audit(
             user,
             "share.viewed",
@@ -616,16 +821,55 @@ class ProductQueryService:
         )
         return self._response_from_record(record, user)
 
-    def export_record(self, query_id: str, user: UserContext) -> dict[str, Any]:
+    def export_record(
+        self,
+        query_id: str,
+        user: UserContext,
+        *,
+        confirm_large_export: bool = False,
+    ) -> dict[str, Any]:
+        self._ensure_not_frozen(user)
         if not user.can_export:
-            raise PermissionError("当前角色无导出权限")
+            reason = "当前角色无导出权限"
+            self._record_access_denied(
+                user,
+                question="导出查询结果",
+                reason=reason,
+                query_id=query_id,
+            )
+            raise PermissionError(reason)
         record = self._owned_query(query_id, user)
-        self._audit(user, "query.exported", "medium", {}, query_id)
-        return record
+        exported_rows = len(record["rows"])
+        if exported_rows > 200 and not confirm_large_export:
+            raise LargeExportConfirmationRequired(exported_rows)
+        metrics = sorted(set(record["plan"].get("metrics") or ()))
+        event_id = self._audit(
+            user,
+            "query.exported",
+            "low",
+            {
+                "exported_rows": exported_rows,
+                "metrics": metrics,
+                "data_level": self._data_level(metrics),
+            },
+            query_id,
+        )
+        self._evaluate_export_alerts(
+            user,
+            event_id=event_id,
+            query_id=query_id,
+            exported_rows=exported_rows,
+            metrics=metrics,
+        )
+        return self._sanitize_record_for_user(record, user)
 
-    def admin_overview(self, user: UserContext) -> dict[str, int]:
+    def admin_overview(self, user: UserContext) -> dict[str, Any]:
         self._require_admin(user)
-        return self.store.overview()
+        return {
+            **self.store.overview(),
+            "audit_chain_valid": self.store.verify_audit_chain(),
+            "open_alert_count": len(self.store.list_alerts(status="open")),
+        }
 
     def admin_users(self, user: UserContext) -> list[dict[str, Any]]:
         self._require_admin(user)
@@ -646,6 +890,38 @@ class ProductQueryService:
             user_id=user_id,
         )
 
+    def admin_alerts(
+        self,
+        user: UserContext,
+        *,
+        status: str = "all",
+        severity: str = "all",
+        user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self._require_admin(user)
+        return self.store.list_alerts(
+            status=status,
+            severity=severity,
+            user_id=user_id,
+        )
+
+    def update_alert_status(
+        self,
+        alert_id: str,
+        status: str,
+        user: UserContext,
+    ) -> dict[str, str]:
+        self._require_admin(user)
+        if not self.store.update_alert_status(alert_id, status):
+            raise ValueError("告警不存在")
+        self._audit(
+            user,
+            "alert.status_updated",
+            "low",
+            {"alert_id": alert_id, "status": status},
+        )
+        return {"alert_id": alert_id, "status": status}
+
     def _response_from_record(
         self,
         record: dict[str, Any],
@@ -653,7 +929,9 @@ class ProductQueryService:
         *,
         alternatives: tuple[ChartSpec, ...] | None = None,
     ) -> ProductQueryResponse:
-        plan = record["plan"]
+        plan = dict(record["plan"])
+        if not user.can_view_sql:
+            plan.pop("sql", None)
         result = QueryResult(
             tuple(record["columns"]),
             tuple(tuple(row) for row in record["rows"]),
@@ -665,11 +943,13 @@ class ProductQueryService:
         records = tuple(result.dictionaries())
         insight_data = record.get("insight")
         insight = Insight(**insight_data) if isinstance(insight_data, dict) else None
-        if user.mask_sensitive_values and self._contains_sensitive_metric(plan):
-            records = self._mask_records(records)
+        if self._should_mask_values(user, plan):
+            records = self._mask_records(
+                records,
+            )
             insight = Insight(
-                headline="敏感指标查询已完成",
-                summary="具体数值已按当前角色权限隐藏，仅保留非敏感维度信息。",
+                headline="查询已完成",
+                summary="查询结果字段已按当前角色权限统一隐藏。",
                 caveats=("如需查看具体数值，请申请相应数据权限。",),
                 confidence="high",
             )
@@ -713,6 +993,7 @@ class ProductQueryService:
                 "can_export": user.can_export,
                 "can_share": user.can_share,
                 "can_view_admin": user.can_view_admin,
+                "can_query_data": user.can_query_data,
             },
             warnings=tuple(record.get("warnings") or ()),
         )
@@ -799,11 +1080,13 @@ class ProductQueryService:
         )
 
     def _authorize_question(self, question: str, user: UserContext) -> None:
-        if user.role == "admin" or not user.allowed_organizations:
+        if user.effective_organization_access != "restricted":
             return
+        if not user.allowed_organizations:
+            raise PermissionError("当前账号尚未配置可访问机构")
         requested = self.core.catalog.resolve_organizations(question)
         if not requested:
-            raise PermissionError("当前数据权限要求在问题中明确指定可访问机构")
+            return
         denied = sorted(set(requested) - set(user.allowed_organizations))
         if denied:
             names = "、".join(self.core.catalog.organizations.get(item, item) for item in denied)
@@ -818,21 +1101,26 @@ class ProductQueryService:
         owner_user_id: str | None = None,
     ) -> None:
         """Clear one user's conversational context and optionally its reports."""
-        if not user.can_view_admin:
-            raise PermissionError(
-                "权限不足：普通用户不能删除查询记录或清空会话，请联系系统管理员"
+        self._ensure_not_frozen(user)
+        if not user.can_clear_sessions:
+            reason = "权限不足：普通用户不能删除查询记录或清空会话，请联系系统管理员"
+            self._record_access_denied(
+                user,
+                question="清除会话",
+                reason=reason,
+                query_id=None,
             )
+            raise PermissionError(reason)
         target_user_id = owner_user_id or user.user_id
         self.core.clear_session(f"{target_user_id}:{session_id}")
         self.store.clear_pending_session(target_user_id, session_id)
         if delete_history:
             deleted = self.store.delete_session_queries(target_user_id, session_id)
-            self.store.add_audit(
-                event_id=uuid.uuid4().hex,
-                user_id=user.user_id,
-                action="session_clear",
-                risk_level="medium",
-                details={
+            self._audit(
+                user,
+                "session_clear",
+                "medium",
+                {
                     "session_id": session_id,
                     "owner_user_id": target_user_id,
                     "deleted_queries": deleted,
@@ -843,40 +1131,169 @@ class ProductQueryService:
     def _internal_session_id(session_id: str, user: UserContext) -> str:
         return f"{user.user_id}:{session_id}"
 
-    def _authorize_plan(self, plan: dict[str, Any], user: UserContext) -> None:
-        if user.role == "admin" or not user.allowed_organizations:
-            return
+    def _authorize_plan(
+        self,
+        plan: dict[str, Any],
+        user: UserContext,
+    ) -> DataAccessScope:
+        if user.role != "viewer" and not user.can_query_data:
+            raise PermissionError("当前业务角色无数据查询权限")
+
+        metrics = set(plan.get("metrics") or ())
+        if not metrics:
+            raise PermissionError("查询计划未声明指标，拒绝访问历史结果")
+        denied_metrics = metrics - set(user.allowed_metric_ids)
+        if denied_metrics:
+            raise PermissionError(
+                "当前岗位无权访问指标：" + "、".join(sorted(denied_metrics))
+            )
+
+        organization_access = user.effective_organization_access
+        if organization_access == "none":
+            raise PermissionError("当前业务角色无机构数据权限")
+        scope_kind = plan.get("organization_scope")
         organizations = set(plan.get("organizations") or ())
-        if not organizations or plan.get("organization_scope") == "all":
-            raise PermissionError("当前查询范围超出机构数据权限")
-        denied = organizations - set(user.allowed_organizations)
-        if denied:
-            raise PermissionError("查询计划包含无权访问的机构")
+        if scope_kind not in {"selected", "all"}:
+            raise PermissionError("查询计划缺少有效机构范围")
+        if scope_kind == "selected" and not organizations:
+            raise PermissionError("查询计划未声明机构，拒绝访问历史结果")
+        unknown_organizations = organizations - set(self.core.catalog.organizations)
+        if unknown_organizations:
+            raise PermissionError(
+                "查询计划包含未知机构：" + "、".join(sorted(unknown_organizations))
+            )
+        organization_scope: tuple[str, ...] | None = None
+        if organization_access == "restricted":
+            allowed = set(user.allowed_organizations)
+            if not allowed:
+                raise PermissionError("当前账号尚未配置可访问机构")
+            if scope_kind == "all":
+                raise PermissionError("当前查询范围超出机构数据权限")
+            denied = organizations - allowed
+            if denied:
+                raise PermissionError(
+                    "查询计划包含无权访问的机构：" + "、".join(sorted(denied))
+                )
+            if plan.get("operation") in CROSS_ORGANIZATION_OPERATIONS:
+                raise PermissionError("当前版本暂不支持局部机构用户执行跨机构排名或省均值计算")
+            if "rank_population_all" in set(plan.get("assumptions") or ()):
+                raise PermissionError("当前版本暂不支持局部机构用户执行全省排名计算")
+            organization_scope = tuple(sorted(organizations))
+        elif (
+            plan.get("organization_scope") == "selected"
+            and plan.get("organizations")
+            and plan.get("operation") not in CROSS_ORGANIZATION_OPERATIONS
+            and "rank_population_all" not in set(plan.get("assumptions") or ())
+        ):
+            organization_scope = tuple(
+                sorted(set(plan.get("organizations") or ()))
+            )
+
+        return DataAccessScope(
+            metric_ids=tuple(sorted(metrics)),
+            organization_ids=organization_scope,
+        )
+
+    def _visible_history_records(
+        self,
+        records: list[dict[str, Any]],
+        user: UserContext,
+    ) -> list[dict[str, Any]]:
+        if user.can_view_admin:
+            return records
+        visible: list[dict[str, Any]] = []
+        for record in records:
+            try:
+                self._authorize_plan(record["plan"], user)
+            except PermissionError:
+                continue
+            visible.append(record)
+        return visible
 
     def _owned_query(self, query_id: str, user: UserContext) -> dict[str, Any]:
         record = self.store.get_query(query_id)
         if not record:
             raise ValueError("查询记录不存在")
-        if not user.can_view_admin and record["user_id"] != user.user_id:
-            raise PermissionError("无权查看该查询记录")
-        self._authorize_plan(record["plan"], user)
+        if not user.can_view_all_queries and record["user_id"] != user.user_id:
+            reason = "无权查看该查询记录"
+            self._record_access_denied(
+                user,
+                question="访问查询记录",
+                reason=reason,
+                query_id=query_id,
+            )
+            raise PermissionError(reason)
+        if not user.can_view_admin:
+            try:
+                self._authorize_plan(record["plan"], user)
+            except PermissionError as exc:
+                self._record_access_denied(
+                    user,
+                    question="访问查询记录",
+                    reason=str(exc),
+                    query_id=query_id,
+                )
+                raise
         return record
 
     @staticmethod
     def _contains_sensitive_metric(plan: dict[str, Any]) -> bool:
         return bool(set(plan.get("metrics") or ()) & SENSITIVE_METRICS)
 
-    @staticmethod
+    def _should_mask_values(
+        self,
+        user: UserContext,
+        plan: dict[str, Any],
+    ) -> bool:
+        return user.mask_all_values or (
+            user.mask_sensitive_values and self._contains_sensitive_metric(plan)
+        )
+
     def _mask_records(
+        self,
         records: tuple[dict[str, Any], ...],
     ) -> tuple[dict[str, Any], ...]:
         return tuple(
             {
-                key: ("***" if key in VALUE_COLUMNS and value is not None else value)
+                key: value if value is None else "***"
                 for key, value in record.items()
             }
             for record in records
         )
+
+    def _sanitize_record_for_user(
+        self,
+        record: dict[str, Any],
+        user: UserContext,
+    ) -> dict[str, Any]:
+        sanitized = dict(record)
+        plan = dict(record["plan"])
+        if not user.can_view_sql:
+            sanitized["sql"] = None
+            plan.pop("sql", None)
+        sanitized["plan"] = plan
+        if not self._should_mask_values(user, plan):
+            return sanitized
+
+        dictionaries = tuple(
+            dict(zip(record["columns"], row, strict=True)) for row in record["rows"]
+        )
+        masked = self._mask_records(
+            dictionaries,
+        )
+        sanitized["rows"] = [
+            [item.get(column) for column in record["columns"]] for item in masked
+        ]
+        sanitized["answer"] = "查询结果字段已按当前角色权限统一隐藏"
+        sanitized["insight"] = {
+            "headline": "查询已完成",
+            "summary": "查询结果字段已按当前角色权限统一隐藏。",
+            "evidence": [],
+            "caveats": ["如需查看具体数值，请申请相应数据权限。"],
+            "confidence": "high",
+            "inference": False,
+        }
+        return sanitized
 
     def _audit(
         self,
@@ -885,20 +1302,258 @@ class ProductQueryService:
         risk_level: str,
         details: dict[str, Any],
         query_id: str | None = None,
-    ) -> None:
-        self.store.add_audit(
-            event_id=uuid.uuid4().hex,
+    ) -> str:
+        event_id = uuid.uuid4().hex
+        return self.store.add_audit(
+            event_id=event_id,
             user_id=user.user_id,
             action=action,
             risk_level=risk_level,
             details=details,
             query_id=query_id,
+            target=query_id,
+            created_at=self._now_datetime(),
         )
 
     @staticmethod
-    def _require_admin(user: UserContext) -> None:
+    def _data_level(metrics: list[str] | tuple[str, ...]) -> str:
+        return "S3" if set(metrics) & SENSITIVE_METRICS else "S2"
+
+    def _ensure_not_frozen(self, user: UserContext) -> None:
+        freeze = self.store.get_active_freeze(
+            user.user_id,
+            now=self._now_datetime(),
+        )
+        if freeze:
+            raise AccountFrozenError(
+                str(freeze["frozen_until"]),
+                str(freeze["reason"]),
+            )
+
+    def _add_alert(
+        self,
+        user: UserContext,
+        *,
+        source_event_id: str,
+        rule_code: str,
+        severity: str,
+        details: dict[str, Any],
+        query_id: str | None,
+    ) -> str:
+        return self.store.add_alert(
+            alert_id=uuid.uuid4().hex,
+            source_event_id=source_event_id,
+            rule_code=rule_code,
+            user_id=user.user_id,
+            query_id=query_id,
+            severity=severity,
+            details=details,
+            created_at=self._now_datetime(),
+        )
+
+    def _record_access_denied(
+        self,
+        user: UserContext,
+        *,
+        question: str,
+        reason: str,
+        query_id: str | None,
+    ) -> None:
+        event_id = self._audit(
+            user,
+            "access.denied",
+            "medium",
+            {"question": question, "reason": reason},
+            query_id,
+        )
+        now = self._now_datetime()
+        since = now - timedelta(minutes=10)
+        with self._security_lock:
+            denied_count = self.store.count_audit_events(
+                user_id=user.user_id,
+                action="access.denied",
+                since=since,
+            )
+            if denied_count < 3 or self.store.has_recent_alert(
+                user_id=user.user_id,
+                rule_code=ALERT_ACCESS_DENIED,
+                since=since,
+            ):
+                return
+            frozen_until = now + timedelta(minutes=15)
+            self.store.add_alert(
+                alert_id=uuid.uuid4().hex,
+                source_event_id=event_id,
+                rule_code=ALERT_ACCESS_DENIED,
+                user_id=user.user_id,
+                severity="high",
+                details={
+                    "window_minutes": 10,
+                    "denied_count": denied_count,
+                    "frozen_minutes": 15,
+                    "frozen_until": frozen_until.isoformat(),
+                },
+                query_id=query_id,
+                created_at=now,
+                frozen_until=frozen_until,
+                freeze_reason="10分钟内连续3次越权访问",
+            )
+
+    def _evaluate_query_alerts(
+        self,
+        user: UserContext,
+        *,
+        event_id: str,
+        query_id: str,
+        metrics: list[str],
+    ) -> None:
+        with self._security_lock:
+            metric_count = len(set(metrics))
+            if metric_count > 8:
+                self._add_alert(
+                    user,
+                    source_event_id=event_id,
+                    rule_code=ALERT_MULTI_METRIC,
+                    severity="medium",
+                    details={"metric_count": metric_count, "threshold": 8},
+                    query_id=query_id,
+                )
+            if self._data_level(metrics) != "S3":
+                return
+            since = self._now_datetime() - timedelta(minutes=5)
+            query_count = sum(
+                self.store.count_audit_events(
+                    user_id=user.user_id,
+                    action=action,
+                    since=since,
+                    data_level="S3",
+                )
+                for action in ("query.completed", "query.time_drill")
+            )
+            if query_count > 10 and not self.store.has_recent_alert(
+                user_id=user.user_id,
+                rule_code=ALERT_S3_FREQUENCY,
+                since=since,
+            ):
+                self._add_alert(
+                    user,
+                    source_event_id=event_id,
+                    rule_code=ALERT_S3_FREQUENCY,
+                    severity="medium",
+                    details={
+                        "window_minutes": 5,
+                        "query_count": query_count,
+                        "threshold": 10,
+                    },
+                    query_id=query_id,
+                )
+
+    def _evaluate_export_alerts(
+        self,
+        user: UserContext,
+        *,
+        event_id: str,
+        query_id: str | None,
+        exported_rows: int,
+        metrics: list[str],
+    ) -> None:
+        with self._security_lock:
+            now = self._now_datetime()
+            if exported_rows > 200:
+                self._add_alert(
+                    user,
+                    source_event_id=event_id,
+                    rule_code=ALERT_LARGE_EXPORT,
+                    severity="medium",
+                    details={"exported_rows": exported_rows, "threshold": 200},
+                    query_id=query_id,
+                )
+
+            local_now = now.astimezone(SHANGHAI_TZ)
+            local_day_start = datetime.combine(
+                local_now.date(),
+                clock_time.min,
+                tzinfo=SHANGHAI_TZ,
+            )
+            day_start = local_day_start.astimezone(timezone.utc)
+            daily_rows = self.store.sum_exported_rows(
+                user_id=user.user_id,
+                since=day_start,
+            )
+            if daily_rows > 1000 and not self.store.has_recent_alert(
+                user_id=user.user_id,
+                rule_code=ALERT_DAILY_EXPORT,
+                since=day_start,
+            ):
+                self._add_alert(
+                    user,
+                    source_event_id=event_id,
+                    rule_code=ALERT_DAILY_EXPORT,
+                    severity="high",
+                    details={"daily_exported_rows": daily_rows, "threshold": 1000},
+                    query_id=query_id,
+                )
+
+            outside_work_hours = local_now.weekday() >= 5 or not (
+                clock_time(8, 0) <= local_now.time() < clock_time(19, 0)
+            )
+            if self._data_level(metrics) == "S3" and outside_work_hours:
+                self._add_alert(
+                    user,
+                    source_event_id=event_id,
+                    rule_code=ALERT_OFF_HOURS_EXPORT,
+                    severity="high",
+                    details={
+                        "exported_rows": exported_rows,
+                        "local_time": local_now.isoformat(),
+                        "work_hours": "工作日08:00-19:00",
+                    },
+                    query_id=query_id,
+                )
+
+    def _evaluate_share_alerts(
+        self,
+        user: UserContext,
+        *,
+        event_id: str,
+        query_id: str,
+    ) -> None:
+        with self._security_lock:
+            since = self._now_datetime() - timedelta(minutes=10)
+            share_count = self.store.count_audit_events(
+                user_id=user.user_id,
+                action="query.shared",
+                since=since,
+            )
+            if share_count >= 3 and not self.store.has_recent_alert(
+                user_id=user.user_id,
+                rule_code=ALERT_SHARE_FREQUENCY,
+                since=since,
+            ):
+                self._add_alert(
+                    user,
+                    source_event_id=event_id,
+                    rule_code=ALERT_SHARE_FREQUENCY,
+                    severity="medium",
+                    details={
+                        "window_minutes": 10,
+                        "share_count": share_count,
+                        "threshold": 3,
+                    },
+                    query_id=query_id,
+                )
+
+    def _require_admin(self, user: UserContext) -> None:
+        self._ensure_not_frozen(user)
         if not user.can_view_admin:
-            raise PermissionError("仅管理员可以访问该功能")
+            reason = "仅管理员可以访问该功能"
+            self._record_access_denied(
+                user,
+                question="访问管理员功能",
+                reason=reason,
+                query_id=None,
+            )
+            raise PermissionError(reason)
 
     @staticmethod
     def _safe_identifier(value: str, label: str) -> str:
@@ -912,6 +1567,7 @@ class ProductQueryService:
         current_date: str | None,
         period_start: str | None,
         period_end: str | None,
+        access_scope: DataAccessScope | None = None,
     ) -> tuple[date, date]:
         if period_start or period_end:
             if not period_start or not period_end:
@@ -923,7 +1579,8 @@ class ProductQueryService:
         if target == "year":
             row = self.core.executor.execute(
                 "SELECT CAST(MIN(data_date) AS VARCHAR), CAST(MAX(data_date) AS VARCHAR) "
-                "FROM metric_values"
+                "FROM metric_values",
+                access_scope,
             ).rows[0]
             return date.fromisoformat(str(row[0])), date.fromisoformat(str(row[1]))
         focus = date.fromisoformat(current_date) if current_date else date.today()
@@ -995,5 +1652,8 @@ class ProductQueryService:
         return {"year": "年度", "quarter": "季度", "month": "月度", "day": "日"}[level]
 
     @staticmethod
-    def _now() -> str:
-        return datetime.now(timezone.utc).isoformat()
+    def _now_datetime() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _now(self) -> str:
+        return self._now_datetime().isoformat()

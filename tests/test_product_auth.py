@@ -5,7 +5,7 @@ import pytest
 from text2sql import api
 
 
-def test_default_accounts_include_three_analysts(monkeypatch) -> None:
+def test_default_accounts_include_six_business_roles(monkeypatch) -> None:
     for name in (
         "TEXT2SQL_ANALYST_USERNAME",
         "TEXT2SQL_ANALYST_PASSWORD",
@@ -13,22 +13,31 @@ def test_default_accounts_include_three_analysts(monkeypatch) -> None:
         "TEXT2SQL_ANALYST_2_PASSWORD",
         "TEXT2SQL_ANALYST_3_USERNAME",
         "TEXT2SQL_ANALYST_3_PASSWORD",
+        "TEXT2SQL_RISK_USERNAME",
+        "TEXT2SQL_RISK_PASSWORD",
+        "TEXT2SQL_FINANCE_USERNAME",
+        "TEXT2SQL_FINANCE_PASSWORD",
     ):
         monkeypatch.delenv(name, raising=False)
     api.get_auth_service.cache_clear()
     client = TestClient(api.app)
 
-    for username, password in (
-        ("analyst", "analyst123"),
-        ("analyst2", "analyst2123"),
-        ("analyst3", "analyst3123"),
+    for username, password, business_role in (
+        ("analyst", "analyst123", "head_office_manager"),
+        ("analyst2", "analyst2123", "branch_manager"),
+        ("analyst3", "analyst3123", "business_staff"),
+        ("risk", "risk123", "risk_compliance"),
+        ("finance", "finance123", "finance_staff"),
+        ("admin", "admin123", "system_admin"),
     ):
         response = client.post(
             "/api/v1/auth/login",
             json={"username": username, "password": password},
         )
         assert response.status_code == 200
-        assert response.json()["user"]["role"] == "analyst"
+        user = response.json()["user"]
+        assert user["business_role"] == business_role
+        assert user["capabilities"]["can_query_data"] == (username != "admin")
 
     api.get_auth_service.cache_clear()
 
@@ -56,6 +65,7 @@ def test_login_logout_and_relogin(monkeypatch) -> None:
     context = api.user_context("spoofed-admin", "admin", "", headers["Authorization"])
     assert context.user_id == "test-analyst"
     assert context.role == "analyst"
+    assert context.business_role == "head_office_manager"
 
     assert client.post("/api/v1/auth/logout", headers=headers).status_code == 200
     assert client.get("/api/v1/auth/me", headers=headers).status_code == 401
@@ -76,6 +86,25 @@ def test_header_auth_can_be_disabled_in_public_deployments(monkeypatch) -> None:
         api.user_context("spoofed-admin", "admin", "", None)
 
     assert exc_info.value.status_code == 401
+
+
+def test_legacy_query_is_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("TEXT2SQL_ENABLE_LEGACY_QUERY", "true")
+    response = TestClient(api.app).post(
+        "/query",
+        json={"question": "查询存款余额"},
+    )
+
+    assert response.status_code == 410
+    assert "已关闭" in response.json()["detail"]
+
+
+def test_shared_query_requires_authenticated_viewer(monkeypatch) -> None:
+    monkeypatch.setenv("TEXT2SQL_ALLOW_HEADER_AUTH", "false")
+
+    response = TestClient(api.app).get("/api/v1/shares/example-token")
+
+    assert response.status_code == 401
 
 
 def test_admin_audit_user_query_parameter_filters_without_shadowing_context(

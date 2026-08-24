@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import re
+from typing import Callable
 import uuid
 
 from .answerer import format_answer, has_deterministic_answer
@@ -22,7 +23,7 @@ from .errors import (
     retry_feedback,
 )
 from .llm_planner import LLMPlanner
-from .models import QueryPlan, QueryResponse, QueryResult, SessionState
+from .models import DataAccessScope, QueryPlan, QueryResponse, QueryResult, SessionState
 from .pending_query import (
     PendingQueryResolver,
     is_slot_only_reply,
@@ -40,6 +41,9 @@ from .validators import (
     SQLGuard,
     answer_obligations,
 )
+
+
+PlanAuthorizer = Callable[[QueryPlan], DataAccessScope | None]
 
 
 class Text2SQLService:
@@ -73,20 +77,30 @@ class Text2SQLService:
         plan: QueryPlan,
         raw_sql: str,
         trace: list[dict[str, object]] | None = None,
+        plan_authorizer: PlanAuthorizer | None = None,
     ) -> tuple[str, QueryResult]:
         if trace is not None:
             trace.append({"stage": "plan_validation", "plan": plan.to_dict()})
         self.plan_validator.validate(plan)
+        access_scope = plan_authorizer(plan) if plan_authorizer else None
+        if trace is not None and plan_authorizer is not None:
+            trace.append({"stage": "authorization", "status": "allowed"})
         approved_sql, expression = self.sql_guard.validate_and_limit(raw_sql)
         if trace is not None:
             trace.append({"stage": "sql_guard", "raw_sql": raw_sql, "approved_sql": approved_sql})
         self.alignment_validator.validate(plan, raw_sql, expression)
         if trace is not None:
             trace.append({"stage": "alignment_validation", "status": "ok"})
-        self.executor.preflight(approved_sql)
+        if access_scope is None:
+            self.executor.preflight(approved_sql)
+        else:
+            self.executor.preflight(approved_sql, access_scope)
         if trace is not None:
             trace.append({"stage": "sql_preflight", "status": "ok"})
-        result = self.executor.execute(approved_sql)
+        if access_scope is None:
+            result = self.executor.execute(approved_sql)
+        else:
+            result = self.executor.execute(approved_sql, access_scope)
         if trace is not None:
             trace.append(
                 {
@@ -98,8 +112,8 @@ class Text2SQLService:
                 }
             )
         self.result_validator.validate(plan, result)
-        self._validate_rank_semantics(plan, result)
-        self._validate_province_average_semantics(plan, result)
+        self._validate_rank_semantics(plan, result, access_scope)
+        self._validate_province_average_semantics(plan, result, access_scope)
         if trace is not None:
             trace.append({"stage": "result_validation", "status": "ok"})
         return approved_sql, result
@@ -125,10 +139,17 @@ class Text2SQLService:
             assumptions.append("require_organization_list")
         return replace(plan, assumptions=tuple(dict.fromkeys(assumptions)))
 
-    def _validate_rank_semantics(self, plan: QueryPlan, result: QueryResult) -> None:
+    def _validate_rank_semantics(
+        self,
+        plan: QueryPlan,
+        result: QueryResult,
+        access_scope: DataAccessScope | None = None,
+    ) -> None:
         """Verify selected-organization ranks against the full organization population."""
         if plan.source != "llm" or "rank_population_all" not in plan.assumptions:
             return
+        if access_scope and access_scope.organization_ids is not None:
+            raise ResultValidationError("当前机构权限范围不支持全省排名校验")
         column_map = {name.lower(): index for index, name in enumerate(result.columns)}
         metric_index = column_map.get("metric_id")
         org_index = column_map.get("org_id")
@@ -188,11 +209,16 @@ class Text2SQLService:
         validate_column(plan.comparison_date, comparison_rank_index, "比较期")
 
     def _validate_province_average_semantics(
-        self, plan: QueryPlan, result: QueryResult
+        self,
+        plan: QueryPlan,
+        result: QueryResult,
+        access_scope: DataAccessScope | None = None,
     ) -> None:
         """Verify every returned province average against all 13 organizations."""
         if not plan.current_date or "province_average" not in result.columns:
             return
+        if access_scope and access_scope.organization_ids is not None:
+            raise ResultValidationError("当前机构权限范围不支持全省均值校验")
         column_map = {name.lower(): index for index, name in enumerate(result.columns)}
         average_index = column_map["province_average"]
         metric_index = column_map.get("metric_id")
@@ -288,6 +314,7 @@ class Text2SQLService:
         use_context: bool,
         trace: list[dict[str, object]],
         stage_prefix: str = "rule",
+        plan_authorizer: PlanAuthorizer | None = None,
     ) -> tuple[QueryResponse | None, RuleDecision, Exception | None]:
         decision = self.rule_planner.plan(
             planning_question,
@@ -311,7 +338,12 @@ class Text2SQLService:
             raw_sql = compile_rule_sql(decision.plan)
             trace.append({"stage": f"{stage_prefix}_sql", "sql": raw_sql})
             plan = replace(decision.plan, sql=raw_sql)
-            sql, result = self._validated_execute(plan, raw_sql, trace)
+            sql, result = self._validated_execute(
+                plan,
+                raw_sql,
+                trace,
+                plan_authorizer,
+            )
             return (
                 self._response(
                     session_id,
@@ -459,6 +491,7 @@ class Text2SQLService:
         decision: RuleDecision,
         initial_feedback: str | None,
         trace: list[dict[str, object]],
+        plan_authorizer: PlanAuthorizer | None = None,
     ) -> QueryResponse:
         feedback = initial_feedback
         last_error: Exception | None = None
@@ -487,7 +520,12 @@ class Text2SQLService:
                 trace.append({"stage": "llm_plan", "attempt": attempt, "plan": plan.to_dict()})
                 if not plan.sql:
                     raise ConfigurationError("LLM计划缺少SQL")
-                sql, result = self._validated_execute(plan, plan.sql, trace)
+                sql, result = self._validated_execute(
+                    plan,
+                    plan.sql,
+                    trace,
+                    plan_authorizer,
+                )
                 warnings = (
                     (f"规则路径降级：{decision.reason}",)
                     if decision.plan or planning_question != response_question
@@ -517,7 +555,13 @@ class Text2SQLService:
             raise last_error
         raise ConfigurationError("LLM兜底未能生成有效查询")
 
-    def ask(self, question: str, session_id: str | None = None) -> QueryResponse:
+    def ask(
+        self,
+        question: str,
+        session_id: str | None = None,
+        *,
+        plan_authorizer: PlanAuthorizer | None = None,
+    ) -> QueryResponse:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("问题不能为空")
         session_id = session_id or uuid.uuid4().hex
@@ -525,7 +569,7 @@ class Text2SQLService:
             {"stage": "request", "question": question, "session_id": session_id}
         ]
         try:
-            return self._ask(question, session_id, trace)
+            return self._ask(question, session_id, trace, plan_authorizer)
         except Exception as exc:
             trace.append({"stage": "failed", "error": f"{type(exc).__name__}: {exc}"})
             exc.diagnostics = trace
@@ -536,6 +580,7 @@ class Text2SQLService:
         question: str,
         session_id: str,
         trace: list[dict[str, object]],
+        plan_authorizer: PlanAuthorizer | None = None,
     ) -> QueryResponse:
         state = self.sessions.get(session_id)
         trace.append(
@@ -604,6 +649,7 @@ class Text2SQLService:
                     use_context=False,
                     trace=trace,
                     stage_prefix="pending_rule",
+                    plan_authorizer=plan_authorizer,
                 )
                 if response is not None:
                     return response
@@ -624,6 +670,7 @@ class Text2SQLService:
                     pending_decision,
                     feedback,
                     trace,
+                    plan_authorizer,
                 )
 
         context = self.context_router.classify(question, state)
@@ -646,6 +693,7 @@ class Text2SQLService:
                 planning_state=SessionState(),
                 use_context=False,
                 trace=trace,
+                plan_authorizer=plan_authorizer,
             )
             if response is not None:
                 return response
@@ -674,6 +722,7 @@ class Text2SQLService:
                 decision,
                 feedback,
                 trace,
+                plan_authorizer,
             )
 
         if context.allow_context_rule:
@@ -686,6 +735,7 @@ class Text2SQLService:
                 use_context=True,
                 trace=trace,
                 stage_prefix="context_rule",
+                plan_authorizer=plan_authorizer,
             )
             if response is not None:
                 return response
@@ -707,6 +757,7 @@ class Text2SQLService:
             use_context=False,
             trace=trace,
             stage_prefix="rewritten_rule",
+            plan_authorizer=plan_authorizer,
         )
         if response is not None:
             return response
@@ -723,6 +774,7 @@ class Text2SQLService:
             rewritten_decision,
             feedback,
             trace,
+            plan_authorizer,
         )
 
     def clear_session(self, session_id: str) -> None:

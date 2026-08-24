@@ -1,12 +1,20 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { getAdminOverview, getAdminUsers, getAudit } from "../lib/api";
-import type { AdminUserSummary, AuditItem } from "../types";
+import {
+  getAdminOverview,
+  getAdminUsers,
+  getAudit,
+  getSecurityAlerts,
+  resolveSecurityAlert,
+  type AdminOverview,
+} from "../lib/api";
+import type { AdminUserSummary, AuditItem, SecurityAlert } from "../types";
 
 type AuditSort = "newest" | "risk_desc" | "risk_asc";
 type RiskFilter = "all" | "elevated" | "low" | "medium" | "high";
 type UserPanel = "all" | "risk" | null;
+type AuditChainStatus = "loading" | "valid" | "invalid" | "error";
 
 const actionLabels: Record<string, string> = {
   "query.completed": "查询完成",
@@ -28,10 +36,23 @@ const riskLabels: Record<RiskFilter, string> = {
   low: "低风险",
 };
 
+const alertRuleLabels: Record<string, string> = {
+  S3_QUERY_FREQUENCY: "敏感指标高频查询",
+  REPEATED_ACCESS_DENIED: "连续越权访问",
+  LARGE_EXPORT: "单次大批量导出",
+  DAILY_EXPORT_VOLUME: "当日累计导出超限",
+  OFF_HOURS_S3_EXPORT: "非工作时间敏感导出",
+  SHARE_LINK_FREQUENCY: "短时高频创建分享",
+  MULTI_METRIC_QUERY: "单次查询指标过多",
+};
+
 export function AdminView() {
-  const [overview, setOverview] = useState<Record<string, number>>({});
+  const [overview, setOverview] = useState<AdminOverview>({});
   const [users, setUsers] = useState<AdminUserSummary[]>([]);
   const [audit, setAudit] = useState<AuditItem[]>([]);
+  const [alerts, setAlerts] = useState<SecurityAlert[]>([]);
+  const [auditChainStatus, setAuditChainStatus] = useState<AuditChainStatus>("loading");
+  const [resolvingAlertId, setResolvingAlertId] = useState("");
   const [sort, setSort] = useState<AuditSort>("newest");
   const [risk, setRisk] = useState<RiskFilter>("all");
   const [selectedUser, setSelectedUser] = useState("");
@@ -41,14 +62,49 @@ export function AdminView() {
   const auditRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
-    Promise.all([getAdminOverview(), getAdminUsers()])
-      .then(([summary, userItems]) => {
-        setOverview(summary);
-        setUsers(userItems);
-      })
-      .catch((caught) => {
-        setError(caught instanceof Error ? caught.message : "管理概览加载失败");
+    let active = true;
+    Promise.allSettled([getAdminOverview(), getAdminUsers(), getSecurityAlerts()])
+      .then(([summaryResult, usersResult, alertsResult]) => {
+        if (!active) return;
+        const failures: string[] = [];
+        if (summaryResult.status === "fulfilled") {
+          setOverview(summaryResult.value);
+          setAuditChainStatus(
+            summaryResult.value.audit_chain_valid === true ? "valid" : "invalid",
+          );
+        } else {
+          setAuditChainStatus("error");
+          failures.push("管理概览");
+        }
+        if (usersResult.status === "fulfilled") setUsers(usersResult.value);
+        else failures.push("用户列表");
+        if (alertsResult.status === "fulfilled") {
+          setAlerts(alertsResult.value);
+          setOverview((current) => ({
+            ...current,
+            open_alert_count: alertsResult.value.length,
+          }));
+        } else failures.push("安全告警");
+        if (failures.length) setError(`${failures.join("、")}加载失败`);
       });
+
+    const alertTimer = window.setInterval(() => {
+      getSecurityAlerts()
+        .then((items) => {
+          if (active) {
+            setAlerts(items);
+            setOverview((current) => ({
+              ...current,
+              open_alert_count: items.length,
+            }));
+          }
+        })
+        .catch(() => undefined);
+    }, 15_000);
+    return () => {
+      active = false;
+      window.clearInterval(alertTimer);
+    };
   }, []);
 
   useEffect(() => {
@@ -98,6 +154,11 @@ export function AdminView() {
       label: "有效分享",
       value: overview.active_share_count ?? 0,
       detail: "未过期且未撤销",
+    },
+    {
+      label: "待处置告警",
+      value: overview.open_alert_count ?? 0,
+      detail: "异常规则实时命中",
     },
   ];
   const displayedUsers =
@@ -170,6 +231,26 @@ export function AdminView() {
     setSelectedUser("");
   }
 
+  async function resolveAlert(alertId: string) {
+    if (resolvingAlertId) return;
+    setResolvingAlertId(alertId);
+    try {
+      await resolveSecurityAlert(alertId);
+      setAlerts((items) => items.filter((item) => item.alert_id !== alertId));
+      setOverview((current) => ({
+        ...current,
+        open_alert_count: Math.max(
+          0,
+          Number(current.open_alert_count ?? 0) - 1,
+        ),
+      }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "告警处置失败");
+    } finally {
+      setResolvingAlertId("");
+    }
+  }
+
   return (
     <section>
       <div className="page-toolbar admin-toolbar">
@@ -178,7 +259,13 @@ export function AdminView() {
         </p>
         <span className="admin-status">
           <span className="status-dot" />
-          审计服务在线
+          {auditChainStatus === "loading"
+            ? "审计链校验中"
+            : auditChainStatus === "valid"
+              ? "审计链校验正常"
+              : auditChainStatus === "invalid"
+                ? "审计链校验异常"
+                : "审计链校验失败"}
         </span>
       </div>
 
@@ -240,6 +327,50 @@ export function AdminView() {
       )}
 
       <div className="admin-grid">
+        <section className="audit-card security-alert-card">
+          <div className="card-head audit-head">
+            <div>
+              <p className="section-kicker">SECURITY ALERTS</p>
+              <h2>待处置安全告警</h2>
+            </div>
+            <span>共 {alerts.length} 条</span>
+          </div>
+          <div className="audit-table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>用户</th>
+                  <th>规则</th>
+                  <th>级别</th>
+                  <th>处置</th>
+                </tr>
+              </thead>
+              <tbody>
+                {alerts.length === 0 && (
+                  <tr><td colSpan={5} className="table-empty">暂无待处置告警。</td></tr>
+                )}
+                {alerts.map((item) => (
+                  <tr key={item.alert_id}>
+                    <td>{new Date(item.created_at).toLocaleString("zh-CN")}</td>
+                    <td>{item.user_id}</td>
+                    <td>{alertRuleLabels[item.rule_code] ?? item.rule_code}</td>
+                    <td><span className={`risk-pill ${item.severity}`}>{item.severity}</span></td>
+                    <td>
+                      <button
+                        type="button"
+                        disabled={Boolean(resolvingAlertId)}
+                        onClick={() => resolveAlert(item.alert_id)}
+                      >
+                        {resolvingAlertId === item.alert_id ? "处置中…" : "标记已处置"}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
         <section className="audit-card" ref={auditRef}>
           <div className="card-head audit-head">
             <div>

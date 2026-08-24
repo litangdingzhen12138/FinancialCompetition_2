@@ -325,6 +325,8 @@ class SQLGuard:
             name = table.name.lower()
             if name not in cte_names and name not in APPROVED_TABLES:
                 raise SQLSafetyError(f"禁止访问非白名单表：{name}")
+            if name == "metric_values" and (table.args.get("db") or table.args.get("catalog")):
+                raise SQLSafetyError("metric_values必须使用未限定表名，以应用数据权限范围")
         if sum(1 for _ in expression.find_all(exp.Join)) > 8:
             raise SQLSafetyError("JOIN数量超过安全上限")
         return expression

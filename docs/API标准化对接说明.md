@@ -24,7 +24,7 @@ http://127.0.0.1:8000
 
 ## 2. 认证
 
-除登录、能力发现和分享访问外，`/api/v1` 接口使用 Bearer Token：
+除登录和能力发现外，`/api/v1` 接口（包括分享访问）均使用 Bearer Token：
 
 ```http
 Authorization: Bearer <access_token>
@@ -42,7 +42,7 @@ Content-Type: application/json
 }
 ```
 
-生产部署必须设置：
+Header 认证默认关闭；生产部署应明确保留：
 
 ```env
 TEXT2SQL_ALLOW_HEADER_AUTH=false
@@ -50,6 +50,8 @@ TEXT2SQL_ALLOW_HEADER_AUTH=false
 
 `X-User-Id`、`X-User-Role` 和 `X-Org-Scope` 仅用于本地演示或受信任网关注入，
 不能直接信任浏览器自行传递的角色。
+文档中的六组默认账号和口令也只供本地比赛演示，联网部署前必须全部替换；
+当前内存访问令牌不替代银行统一身份认证。
 
 ## 3. 公共请求追踪
 
@@ -178,9 +180,13 @@ GET /api/v1/queries/{query_id}/answer/stream
 | GET | `/api/v1/shares/{token}` | 访问分享结果 |
 | GET | `/api/v1/admin/overview` | 管理概览 |
 | GET | `/api/v1/admin/audit` | 操作审计 |
+| GET | `/api/v1/admin/alerts` | 安全告警列表 |
+| PATCH | `/api/v1/admin/alerts/{alert_id}` | 确认或关闭告警 |
 | GET | `/api/v1/admin/users` | 审计用户列表 |
 
-旧 `/query` 和 `/sessions/{session_id}` 仅用于兼容，不作为新系统对接入口。
+旧 `/query` 和 `/sessions/{session_id}` 固定返回410，避免形成匿名、无权限范围和无审计的旁路；本地批量回归请直接调用 Python/CLI 入口。
+
+单次或批量导出超过200行时先返回409；调用方确认后追加 `confirm_large_export=true` 重试。连续越权触发冻结后，业务接口返回423及解冻时间。
 
 ## 7. 统一错误响应
 
@@ -200,7 +206,10 @@ JSON 接口错误保持原有 `detail` 字段，同时增加机器可读错误�
 | 401 | `AUTH_UNAUTHORIZED` | 未登录或令牌失效 |
 | 403 | `AUTH_FORBIDDEN` | 权限不足 |
 | 404 | `RESOURCE_NOT_FOUND` | 资源不存在 |
+| 409 | `CONFIRMATION_REQUIRED` | 大批量导出需要二次确认 |
+| 410 | `LEGACY_ENDPOINT_DISABLED` | 旧版旁路接口已关闭 |
 | 422 | `REQUEST_VALIDATION_ERROR` | 请求字段校验失败 |
+| 423 | `ACCOUNT_FROZEN` | 异常访问触发临时冻结 |
 | 429 | `RATE_LIMITED` | 请求过于频繁，由网关执行 |
 | 500 | `SYSTEM_ERROR` | 系统内部错误 |
 | 504 | `QUERY_TIMEOUT` | 查询超时，由网关或执行器执行 |

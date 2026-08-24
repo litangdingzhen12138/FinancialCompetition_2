@@ -23,8 +23,17 @@ from pydantic import BaseModel, Field
 
 from .errors import Text2SQLError
 from .product_auth import ProductAuthService
-from .product_models import ProductQueryResponse, TimeGranularity, UserContext
-from .product_service import ProductQueryService
+from .product_models import (
+    BusinessRole,
+    ProductQueryResponse,
+    TimeGranularity,
+    UserContext,
+)
+from .product_service import (
+    AccountFrozenError,
+    LargeExportConfirmationRequired,
+    ProductQueryService,
+)
 from .product_store import ProductStore
 from .service import Text2SQLService
 
@@ -70,6 +79,9 @@ ERROR_CODE_BY_STATUS = {
     400: "REQUEST_INVALID",
     401: "AUTH_UNAUTHORIZED",
     403: "AUTH_FORBIDDEN",
+    409: "CONFIRMATION_REQUIRED",
+    410: "LEGACY_ENDPOINT_DISABLED",
+    423: "ACCOUNT_FROZEN",
     404: "RESOURCE_NOT_FOUND",
     422: "REQUEST_VALIDATION_ERROR",
     429: "RATE_LIMITED",
@@ -86,7 +98,7 @@ class ErrorResponse(BaseModel):
 
 ERROR_RESPONSES = {
     status: {"model": ErrorResponse}
-    for status in (400, 401, 403, 404, 422, 500)
+    for status in (400, 401, 403, 404, 409, 410, 422, 423, 500)
 }
 SSE_RESPONSES = {
     200: {
@@ -182,6 +194,10 @@ class RenameSessionRequest(BaseModel):
     owner_user_id: str | None = Field(default=None, max_length=128)
 
 
+class AlertStatusRequest(BaseModel):
+    status: str = Field(pattern="^(acknowledged|resolved)$")
+
+
 @lru_cache(maxsize=1)
 def get_service() -> Text2SQLService:
     return Text2SQLService()
@@ -209,18 +225,50 @@ def user_context(
             return get_auth_service().resolve_bearer(authorization).to_context()
         except PermissionError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
-    allow_header_auth = os.getenv("TEXT2SQL_ALLOW_HEADER_AUTH", "true").strip().lower()
+    allow_header_auth = os.getenv("TEXT2SQL_ALLOW_HEADER_AUTH", "false").strip().lower()
     if allow_header_auth not in {"1", "true", "yes", "on"}:
         raise HTTPException(status_code=401, detail="请先登录")
-    if x_user_role not in {"viewer", "analyst", "admin"}:
-        raise HTTPException(status_code=400, detail="X-User-Role必须是viewer、analyst或admin")
+    business_roles: set[BusinessRole] = {
+        "head_office_manager",
+        "branch_manager",
+        "business_staff",
+        "risk_compliance",
+        "finance_staff",
+        "system_admin",
+    }
+    if x_user_role not in {"viewer", "analyst", "admin", *business_roles}:
+        raise HTTPException(status_code=400, detail="X-User-Role不是受支持的角色")
     organizations = tuple(
         value.strip() for value in x_org_scope.split(",") if value.strip()
     )
+    business_role: BusinessRole | None
+    if x_user_role in business_roles:
+        business_role = x_user_role  # type: ignore[assignment]
+        role = "admin" if business_role == "system_admin" else "analyst"
+    else:
+        role = x_user_role
+        business_role = (
+            "branch_manager"
+            if role == "analyst" and organizations
+            else "head_office_manager"
+            if role == "analyst"
+            else "system_admin"
+            if role == "admin"
+            else None
+        )
+    organization_access = (
+        "restricted"
+        if business_role in {"branch_manager", "business_staff"}
+        else "none"
+        if business_role == "system_admin"
+        else "all"
+    )
     return UserContext(
         user_id=x_user_id,
-        role=x_user_role,
+        role=role,
         allowed_organizations=organizations,
+        business_role=business_role,
+        organization_access=organization_access,
     )
 
 
@@ -251,7 +299,7 @@ def login(request: LoginRequest) -> dict[str, object]:
 )
 def current_user(
     authorization: str | None = Header(default=None),
-) -> dict[str, str]:
+) -> dict[str, object]:
     try:
         return get_auth_service().resolve_bearer(authorization).to_dict()
     except PermissionError as exc:
@@ -274,10 +322,10 @@ def logout(authorization: str | None = Header(default=None)) -> dict[str, bool]:
 
 @app.post("/query", tags=["兼容接口"], summary="旧版智能问数")
 def query(request: QueryRequest) -> dict[str, object]:
-    try:
-        return get_service().ask(request.question, request.session_id).to_dict()
-    except (Text2SQLError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(
+        status_code=410,
+        detail="旧版/query已关闭，请登录后使用/api/v1/queries",
+    )
 
 
 @app.delete(
@@ -286,11 +334,31 @@ def query(request: QueryRequest) -> dict[str, object]:
     summary="清除旧版会话",
 )
 def clear_session(session_id: str) -> dict[str, bool]:
-    get_service().clear_session(session_id)
-    return {"cleared": True}
+    raise HTTPException(
+        status_code=410,
+        detail="旧版会话接口已关闭，请使用/api/v1/sessions",
+    )
 
 
 def _product_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, AccountFrozenError):
+        return HTTPException(
+            status_code=423,
+            detail={
+                "message": str(exc),
+                "frozen_until": exc.frozen_until,
+                "reason": exc.reason,
+            },
+        )
+    if isinstance(exc, LargeExportConfirmationRequired):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "row_count": exc.row_count,
+                "confirm_parameter": "confirm_large_export=true",
+            },
+        )
     if isinstance(exc, PermissionError):
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, (Text2SQLError, ValueError)):
@@ -316,6 +384,9 @@ def capabilities() -> dict[str, object]:
             "export": ["xlsx", "csv"],
             "share": True,
             "audit": True,
+            "fine_grained_permissions": True,
+            "dynamic_masking": True,
+            "security_alerts": True,
         },
         "time_aggregation": "period_end",
     }
@@ -456,7 +527,13 @@ def product_query_stream(
                 },
             )
         except Exception as exc:
-            status = 403 if isinstance(exc, PermissionError) else 400
+            status = (
+                423
+                if isinstance(exc, AccountFrozenError)
+                else 403
+                if isinstance(exc, PermissionError)
+                else 400
+            )
             message = (
                 str(exc)
                 if isinstance(exc, (PermissionError, Text2SQLError, ValueError))
@@ -507,7 +584,13 @@ def final_answer_stream(
             ):
                 yield _sse(event, payload)
         except Exception as exc:
-            status = 403 if isinstance(exc, PermissionError) else 400
+            status = (
+                423
+                if isinstance(exc, AccountFrozenError)
+                else 403
+                if isinstance(exc, PermissionError)
+                else 400
+            )
             message = (
                 str(exc)
                 if isinstance(exc, (PermissionError, Text2SQLError, ValueError))
@@ -577,9 +660,12 @@ def history(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     user = user_context(x_user_id, x_user_role, x_org_scope, authorization)
-    return {
-        "items": get_product_service().history(user, limit=limit, keyword=keyword)
-    }
+    try:
+        return {
+            "items": get_product_service().history(user, limit=limit, keyword=keyword)
+        }
+    except Exception as exc:
+        raise _product_error(exc) from exc
 
 
 @app.get(
@@ -644,6 +730,7 @@ def batch_export_history(
     recent_count: int = Query(default=20, ge=1, le=5000),
     session_id: str | None = Query(default=None, max_length=128),
     owner_user_id: str | None = Query(default=None, max_length=128),
+    confirm_large_export: bool = Query(default=False),
     x_user_id: str = Header(default="demo-analyst", max_length=128),
     x_user_role: str = Header(default="analyst"),
     x_org_scope: str = Header(default="", max_length=2000),
@@ -657,6 +744,7 @@ def batch_export_history(
             recent_count=recent_count,
             session_id=session_id,
             owner_user_id=owner_user_id,
+            confirm_large_export=confirm_large_export,
         )
     except Exception as exc:
         raise _product_error(exc) from exc
@@ -744,6 +832,7 @@ def batch_export_history(
 def export_query(
     query_id: str,
     format: str = Query(default="xlsx", pattern="^(xlsx|csv)$"),
+    confirm_large_export: bool = Query(default=False),
     x_user_id: str = Header(default="demo-analyst", max_length=128),
     x_user_role: str = Header(default="analyst"),
     x_org_scope: str = Header(default="", max_length=2000),
@@ -751,7 +840,11 @@ def export_query(
 ) -> Response:
     user = user_context(x_user_id, x_user_role, x_org_scope, authorization)
     try:
-        record = get_product_service().export_record(query_id, user)
+        record = get_product_service().export_record(
+            query_id,
+            user,
+            confirm_large_export=confirm_large_export,
+        )
     except Exception as exc:
         raise _product_error(exc) from exc
     filename = f"bank-query-{query_id[:8]}"
@@ -821,12 +914,9 @@ def shared_query(
     x_user_id: str = Header(default="demo-viewer", max_length=128),
     x_user_role: str = Header(default="viewer"),
     x_org_scope: str = Header(default="", max_length=2000),
+    authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
-    user = UserContext(
-        user_id="shared-viewer",
-        role="viewer",
-        allowed_organizations=(),
-    )
+    user = user_context(x_user_id, x_user_role, x_org_scope, authorization)
     try:
         return get_product_service().resolve_share(token, user).to_dict()
     except Exception as exc:
@@ -843,7 +933,7 @@ def admin_overview(
     x_user_id: str = Header(default="demo-admin", max_length=128),
     x_user_role: str = Header(default="admin"),
     authorization: str | None = Header(default=None),
-) -> dict[str, int]:
+) -> dict[str, Any]:
     user = user_context(x_user_id, x_user_role, "", authorization)
     try:
         return get_product_service().admin_overview(user)
@@ -875,6 +965,58 @@ def admin_audit(
                 user_id=audit_user,
             )
         }
+    except Exception as exc:
+        raise _product_error(exc) from exc
+
+
+@app.get(
+    "/api/v1/admin/alerts",
+    tags=["管理"],
+    summary="查询安全告警",
+    responses=ERROR_RESPONSES,
+)
+def admin_alerts(
+    status: str = Query(default="all", pattern="^(all|open|acknowledged|resolved)$"),
+    severity: str = Query(default="all", pattern="^(all|low|medium|high)$"),
+    alert_user: str | None = Query(default=None, max_length=128, alias="user"),
+    x_user_id: str = Header(default="demo-admin", max_length=128),
+    x_user_role: str = Header(default="admin"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    current_user = user_context(x_user_id, x_user_role, "", authorization)
+    try:
+        return {
+            "items": get_product_service().admin_alerts(
+                current_user,
+                status=status,
+                severity=severity,
+                user_id=alert_user,
+            )
+        }
+    except Exception as exc:
+        raise _product_error(exc) from exc
+
+
+@app.patch(
+    "/api/v1/admin/alerts/{alert_id}",
+    tags=["管理"],
+    summary="处置安全告警",
+    responses=ERROR_RESPONSES,
+)
+def update_admin_alert(
+    alert_id: str,
+    request: AlertStatusRequest,
+    x_user_id: str = Header(default="demo-admin", max_length=128),
+    x_user_role: str = Header(default="admin"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    current_user = user_context(x_user_id, x_user_role, "", authorization)
+    try:
+        return get_product_service().update_alert_status(
+            alert_id,
+            request.status,
+            current_user,
+        )
     except Exception as exc:
         raise _product_error(exc) from exc
 

@@ -10,7 +10,7 @@ import re
 import duckdb
 
 from .errors import QueryExecutionError
-from .models import QueryResult
+from .models import DataAccessScope, QueryResult
 
 
 SAFE_IDENTIFIER = re.compile(r'"([A-Za-z_][A-Za-z0-9_]{0,63})"')
@@ -57,9 +57,54 @@ class DuckDBExecutor:
         self.db_path = db_path
         self.hard_limit = hard_limit
 
-    def preflight(self, sql: str) -> None:
+    @staticmethod
+    def _sql_literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    def _apply_scope(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        scope: DataAccessScope | None,
+    ) -> None:
+        if scope is None:
+            return
+        database_name = str(connection.execute("SELECT current_database()").fetchone()[0])
+        quoted_database = '"' + database_name.replace('"', '""') + '"'
+        predicates = [
+            (
+                "metric_id IN ("
+                + ", ".join(self._sql_literal(item) for item in scope.metric_ids)
+                + ")"
+                if scope.metric_ids
+                else "FALSE"
+            )
+        ]
+        if scope.organization_ids is not None:
+            predicates.append(
+                (
+                    "org_id IN ("
+                    + ", ".join(
+                        self._sql_literal(item) for item in scope.organization_ids
+                    )
+                    + ")"
+                )
+                if scope.organization_ids
+                else "FALSE"
+            )
+        connection.execute(
+            "CREATE TEMP VIEW metric_values AS "
+            f"SELECT * FROM {quoted_database}.main.metric_values "
+            f"WHERE {' AND '.join(predicates)}"
+        )
+
+    def preflight(
+        self,
+        sql: str,
+        scope: DataAccessScope | None = None,
+    ) -> None:
         connection = duckdb.connect(str(self.db_path), read_only=True)
         try:
+            self._apply_scope(connection, scope)
             connection.execute("EXPLAIN " + sql).fetchall()
         except Exception as exc:
             raise QueryExecutionError(
@@ -68,11 +113,16 @@ class DuckDBExecutor:
         finally:
             connection.close()
 
-    def execute(self, sql: str) -> QueryResult:
+    def execute(
+        self,
+        sql: str,
+        scope: DataAccessScope | None = None,
+    ) -> QueryResult:
         connection = duckdb.connect(str(self.db_path), read_only=True)
         try:
             connection.execute("SET memory_limit='1GB'")
             connection.execute("SET threads=4")
+            self._apply_scope(connection, scope)
             cursor = connection.execute(sql)
             if cursor.description is None:
                 raise QueryExecutionError("查询没有返回结果集")

@@ -1,5 +1,6 @@
 import type {
   AuditItem,
+  SecurityAlert,
   AnswerMode,
   AdminUserSummary,
   HistoryItem,
@@ -15,11 +16,27 @@ const AUTH_TOKEN_KEY = "bankinsight.auth.token";
 const AUTH_USER_KEY = "bankinsight.auth.user";
 let cachedAuthUser: AuthUser | null = null;
 
+export type BusinessRole =
+  | "head_office_manager"
+  | "branch_manager"
+  | "business_staff"
+  | "risk_compliance"
+  | "finance_staff"
+  | "system_admin";
+
+export type AuthCapabilities = {
+  can_query_data: boolean;
+  can_view_admin: boolean;
+};
+
 export type AuthUser = {
   user_id: string;
   username: string;
   display_name: string;
   role: "analyst" | "admin";
+  business_role: BusinessRole;
+  business_role_label: string;
+  capabilities: AuthCapabilities;
 };
 
 function rememberAuthUser(user: AuthUser | null): void {
@@ -74,8 +91,12 @@ type FinalAnswerHandlers = {
 
 async function errorMessage(response: Response): Promise<string> {
   try {
-    const payload = (await response.json()) as { detail?: string };
-    return payload.detail || `请求失败（${response.status}）`;
+    const payload = (await response.json()) as {
+      detail?: string | { message?: string };
+    };
+    if (typeof payload.detail === "string") return payload.detail;
+    if (payload.detail?.message) return payload.detail.message;
+    return `请求失败（${response.status}）`;
   } catch {
     return `请求失败（${response.status}）`;
   }
@@ -366,9 +387,8 @@ export async function downloadHistoryBatch(options: {
   }
   if (options.sessionId) parameters.set("session_id", options.sessionId);
   if (options.ownerUserId) parameters.set("owner_user_id", options.ownerUserId);
-  const response = await fetch(
+  const response = await fetchExportWithConfirmation(
     `${API_BASE}/api/v1/history/export/batch?${parameters}`,
-    { headers: authHeaders() },
   );
   if (!response.ok) throw new Error(await errorMessage(response));
   const blob = await response.blob();
@@ -405,9 +425,8 @@ export async function downloadExport(
   queryId: string,
   format: "xlsx" | "csv",
 ): Promise<void> {
-  const response = await fetch(
+  const response = await fetchExportWithConfirmation(
     `${API_BASE}/api/v1/queries/${queryId}/export?format=${format}`,
-    { headers: authHeaders() },
   );
   if (!response.ok) throw new Error(await errorMessage(response));
   const blob = await response.blob();
@@ -421,25 +440,41 @@ export async function downloadExport(
   URL.revokeObjectURL(url);
 }
 
+async function fetchExportWithConfirmation(url: string): Promise<Response> {
+  let response = await fetch(url, { headers: authHeaders() });
+  if (response.status !== 409) return response;
+
+  const payload = (await response.json()) as {
+    detail?: { message?: string; row_count?: number };
+  };
+  const message = payload.detail?.message || "本次导出数据量较大，是否继续？";
+  if (!window.confirm(message)) throw new Error("已取消大批量导出");
+
+  const separator = url.includes("?") ? "&" : "?";
+  response = await fetch(`${url}${separator}confirm_large_export=true`, {
+    headers: authHeaders(),
+  });
+  return response;
+}
+
 export async function getSharedQuery(token: string): Promise<QueryResponse> {
   const response = await fetch(`${API_BASE}/api/v1/shares/${token}`, {
-    headers: {
-      "X-User-Id": "demo-viewer",
-      "X-User-Role": "viewer",
-    },
+    headers: authHeaders(),
     cache: "no-store",
   });
   if (!response.ok) throw new Error(await errorMessage(response));
   return response.json() as Promise<QueryResponse>;
 }
 
-export async function getAdminOverview(): Promise<Record<string, number>> {
+export type AdminOverview = Record<string, number | boolean>;
+
+export async function getAdminOverview(): Promise<AdminOverview> {
   const response = await fetch(`${API_BASE}/api/v1/admin/overview`, {
     headers: authHeaders(),
     cache: "no-store",
   });
   if (!response.ok) throw new Error(await errorMessage(response));
-  return response.json() as Promise<Record<string, number>>;
+  return response.json() as Promise<AdminOverview>;
 }
 
 export async function getAudit(
@@ -466,4 +501,25 @@ export async function getAdminUsers(): Promise<AdminUserSummary[]> {
   if (!response.ok) throw new Error(await errorMessage(response));
   const payload = (await response.json()) as { items: AdminUserSummary[] };
   return payload.items;
+}
+
+export async function getSecurityAlerts(
+  status: "all" | "open" | "acknowledged" | "resolved" = "open",
+): Promise<SecurityAlert[]> {
+  const response = await fetch(
+    `${API_BASE}/api/v1/admin/alerts?status=${status}`,
+    { headers: authHeaders(), cache: "no-store" },
+  );
+  if (!response.ok) throw new Error(await errorMessage(response));
+  const payload = (await response.json()) as { items: SecurityAlert[] };
+  return payload.items;
+}
+
+export async function resolveSecurityAlert(alertId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/v1/admin/alerts/${alertId}`, {
+    method: "PATCH",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ status: "resolved" }),
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
 }

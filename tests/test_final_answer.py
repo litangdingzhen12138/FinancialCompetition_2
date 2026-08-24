@@ -90,7 +90,12 @@ def test_product_query_defers_only_unmatched_answer_to_llm(
             yield "A市农商行各项存款余额"
             yield "为42.32亿元。"
 
-    def fake_ask(question: str, session_id: str) -> QueryResponse:
+    def fake_ask(
+        question: str,
+        session_id: str,
+        *,
+        plan_authorizer=None,
+    ) -> QueryResponse:
         return QueryResponse(
             answer="通用格式化结果",
             answer_mode="llm",
@@ -153,7 +158,12 @@ def test_product_query_falls_back_to_core_answer_when_final_llm_fails(
             raise RuntimeError("upstream stream failed")
             yield  # pragma: no cover
 
-    def fake_ask(question: str, session_id: str) -> QueryResponse:
+    def fake_ask(
+        question: str,
+        session_id: str,
+        *,
+        plan_authorizer=None,
+    ) -> QueryResponse:
         return QueryResponse(
             answer="江苏省C市农商行：净利润回落额为7.9万元；净利润/存款比为241.73%",
             answer_mode="llm",

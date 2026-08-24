@@ -91,23 +91,24 @@ def test_clear_product_session_removes_only_conversation_memory(service, tmp_pat
     service.settings = settings
     product = ProductQueryService(service, ProductStore(settings.product_db_path))
     admin = UserContext("admin", "admin")
+    owner = UserContext("session-owner", "analyst")
     session_id = "session-to-clear"
     response = product.query(
         "江苏省A市农商行在2026年3月31日，各项存款余额是多少？",
         session_id,
-        admin,
+        owner,
     )
     product.store.save_pending_session(
-        admin.user_id,
+        owner.user_id,
         session_id,
         {"original_question": "待补充问题", "missing_slots": ["date"]},
     )
 
-    product.clear_session(session_id, admin)
+    product.clear_session(session_id, admin, owner_user_id=owner.user_id)
 
-    internal_session_id = f"{admin.user_id}:{session_id}"
+    internal_session_id = f"{owner.user_id}:{session_id}"
     assert service.sessions.get(internal_session_id).recent_turns == ()
-    assert product.store.get_pending_session(admin.user_id, session_id) is None
+    assert product.store.get_pending_session(owner.user_id, session_id) is None
     assert product.get_query(response.query_id, admin).query_id == response.query_id
 
 
@@ -136,19 +137,25 @@ def test_delete_product_session_removes_reports_but_keeps_audit(service, tmp_pat
     service.settings = settings
     product = ProductQueryService(service, ProductStore(settings.product_db_path))
     admin = UserContext("admin", "admin")
+    owner = UserContext("delete-owner", "analyst")
     session_id = "session-to-delete"
     product.query(
         "江苏省A市农商行在2026年3月31日，各项存款余额是多少？",
         session_id,
-        admin,
+        owner,
     )
 
-    product.clear_session(session_id, admin, delete_history=True)
+    product.clear_session(
+        session_id,
+        admin,
+        delete_history=True,
+        owner_user_id=owner.user_id,
+    )
 
     assert product.history(admin) == []
     audit = product.store.list_audit()
-    assert audit[0]["action"] == "session_clear"
-    assert audit[0]["details"]["deleted_queries"] == 1
+    cleared = next(item for item in audit if item["action"] == "session_clear")
+    assert cleared["details"]["deleted_queries"] == 1
 
 
 def test_session_history_returns_every_turn_in_order(service, tmp_path) -> None:
@@ -220,19 +227,15 @@ def test_batch_export_records_supports_all_recent_and_session_scope(service, tmp
         scope="session",
         session_id="export-session-a",
     )
-    admin_rows = product.batch_export_records(
-        UserContext("admin", "admin"),
-        scope="all",
-    )
+    with pytest.raises(PermissionError, match="无导出权限"):
+        product.batch_export_records(
+            UserContext("admin", "admin"),
+            scope="all",
+        )
 
     assert {item["query_id"] for item in all_rows} == {first.query_id, second.query_id}
     assert [item["query_id"] for item in recent_rows] == [second.query_id]
     assert [item["query_id"] for item in session_rows] == [first.query_id]
-    assert {item["query_id"] for item in admin_rows} == {
-        first.query_id,
-        second.query_id,
-        third.query_id,
-    }
 
 
 def test_audit_has_no_fixed_limit_and_supports_risk_sorting(tmp_path) -> None:

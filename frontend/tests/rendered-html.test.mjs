@@ -88,8 +88,17 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
   assert.match(appShell, /LoginView/);
   assert.match(appShell, /useState<AuthUser \| null>\(getRememberedAuthUser\)/);
   assert.match(api, /getRememberedAuthUser/);
+  assert.match(api, /export type BusinessRole/);
+  assert.match(api, /business_role_label: string/);
+  assert.match(api, /can_query_data: boolean/);
+  assert.match(api, /can_view_admin: boolean/);
   assert.match(loginView, /正在进入工作空间/);
   assert.match(loginView, /登录数衡/);
+  assert.match(loginView, /风险合规人员：risk \/ risk123/);
+  assert.match(loginView, /财务人员：finance \/ finance123/);
+  assert.match(appShell, /user\.capabilities\?\.can_query_data/);
+  assert.match(appShell, /user\.capabilities\?\.can_view_admin/);
+  assert.match(appShell, /business_role_label/);
   assert.ok(
     queryResult.indexOf("最终回答") < queryResult.indexOf("chart-card"),
     "最终回答应显示在图表分析之前",

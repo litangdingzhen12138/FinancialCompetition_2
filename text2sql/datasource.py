@@ -9,7 +9,7 @@ from typing import Protocol, runtime_checkable
 from .config import Settings
 from .data_builder import ensure_database
 from .executor import DuckDBExecutor
-from .models import QueryResult
+from .models import DataAccessScope, QueryResult
 from .semantic_catalog import SemanticCatalog
 
 
@@ -20,9 +20,17 @@ class DataSourceAdapter(Protocol):
     db_path: Path
     catalog: SemanticCatalog
 
-    def preflight(self, sql: str) -> None: ...
+    def preflight(
+        self,
+        sql: str,
+        scope: DataAccessScope | None = None,
+    ) -> None: ...
 
-    def execute(self, sql: str) -> QueryResult: ...
+    def execute(
+        self,
+        sql: str,
+        scope: DataAccessScope | None = None,
+    ) -> QueryResult: ...
 
 
 @dataclass(slots=True)
@@ -42,8 +50,16 @@ class DuckDBDataSourceAdapter:
             executor=DuckDBExecutor(db_path, settings.hard_row_limit),
         )
 
-    def preflight(self, sql: str) -> None:
-        self.executor.preflight(sql)
+    def preflight(
+        self,
+        sql: str,
+        scope: DataAccessScope | None = None,
+    ) -> None:
+        self.executor.preflight(sql, scope)
 
-    def execute(self, sql: str) -> QueryResult:
-        return self.executor.execute(sql)
+    def execute(
+        self,
+        sql: str,
+        scope: DataAccessScope | None = None,
+    ) -> QueryResult:
+        return self.executor.execute(sql, scope)

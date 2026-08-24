@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 import {
   getCurrentUser,
@@ -19,6 +19,7 @@ const navigation = [
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
+  const router = useRouter();
   const [user, setUser] = useState<AuthUser | null>(getRememberedAuthUser);
   const [checking, setChecking] = useState(true);
   const [loggingOut, setLoggingOut] = useState(false);
@@ -31,15 +32,42 @@ export function AppShell({ children }: { children: ReactNode }) {
       .finally(() => setChecking(false));
   }, []);
 
+  const canQueryData = user
+    ? (user.capabilities?.can_query_data ?? user.role !== "admin")
+    : false;
+  const canViewAdmin = user
+    ? (user.capabilities?.can_view_admin ?? user.role === "admin")
+    : false;
+  const isAdminPath = pathname.startsWith("/admin");
+  const isDataPath = pathname === "/" || pathname.startsWith("/history");
+  const canViewCurrentPath =
+    !user || (isAdminPath ? canViewAdmin : isDataPath ? canQueryData : true);
+
+  useEffect(() => {
+    if (!user || checking || canViewCurrentPath) return;
+    if (canViewAdmin) router.replace("/admin");
+    else if (canQueryData) router.replace("/");
+  }, [canQueryData, canViewAdmin, canViewCurrentPath, checking, router, user]);
+
   if (!user) {
     return <LoginView checking={checking} onLoggedIn={setUser} />;
   }
 
+  if (!canViewCurrentPath) {
+    return (
+      <main className="auth-restore-screen" role="status" aria-live="polite">
+        <span className="auth-restore-mark" aria-hidden="true">衡</span>
+        <p>正在进入有权限的工作空间…</p>
+      </main>
+    );
+  }
+
   const avatar = Array.from(user.display_name)[0] ?? "用";
-  const visibleNavigation =
-    user.role === "admin"
-      ? navigation
-      : navigation.filter((item) => item.href !== "/admin");
+  const roleLabel =
+    user.business_role_label || (user.role === "admin" ? "系统管理员" : "业务用户");
+  const visibleNavigation = navigation.filter((item) =>
+    item.href === "/admin" ? canViewAdmin : canQueryData,
+  );
 
   async function handleLogout() {
     if (loggingOut) return;
@@ -117,7 +145,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               <span className="avatar">{avatar}</span>
               <span>
                 <strong>{user.display_name}</strong>
-                <small>{user.username}</small>
+                <small>{roleLabel} · {user.username}</small>
               </span>
             </div>
             <button

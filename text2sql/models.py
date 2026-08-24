@@ -20,6 +20,14 @@ class PlanFilter:
 
 
 @dataclass(frozen=True, slots=True)
+class DataAccessScope:
+    """Database-enforced metric and organization boundaries for one query."""
+
+    metric_ids: tuple[str, ...]
+    organization_ids: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class QueryPlan:
     source: PlanSource
     query_type: str

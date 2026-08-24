@@ -61,6 +61,7 @@ export type QueryResponse = {
     can_export: boolean;
     can_share: boolean;
     can_view_admin: boolean;
+    can_query_data: boolean;
   };
   warnings: string[];
 };
@@ -96,4 +97,17 @@ export type AuditItem = {
   risk_level: "low" | "medium" | "high";
   details: Record<string, unknown>;
   created_at: string;
+};
+
+export type SecurityAlert = {
+  alert_id: string;
+  source_event_id: string;
+  rule_code: string;
+  user_id: string;
+  query_id: string | null;
+  severity: "low" | "medium" | "high";
+  status: "open" | "acknowledged" | "resolved";
+  details: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
 };

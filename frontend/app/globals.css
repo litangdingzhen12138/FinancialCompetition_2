@@ -3083,8 +3083,8 @@ td {
     margin-left: 16px;
   }
 
-  .audit-card th:nth-child(5),
-  .audit-card td:nth-child(5) {
+  .audit-card:not(.security-alert-card) th:nth-child(5),
+  .audit-card:not(.security-alert-card) td:nth-child(5) {
     display: none;
   }
 

@@ -101,8 +101,9 @@ export function LoginView({
                 : "登录"}
           </button>
           <small className="demo-account-tip">
-            默认分析员：analyst / analyst123；analyst2 / analyst2123；
-            analyst3 / analyst3123　管理员：admin / admin123
+            总行管理层：analyst / analyst123；分支行管理层：analyst2 / analyst2123；
+            业务条线人员：analyst3 / analyst3123；风险合规人员：risk / risk123；
+            财务人员：finance / finance123；系统管理员：admin / admin123
           </small>
         </form>
       </section>
