@@ -2,29 +2,49 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import lru_cache
 
 from io import BytesIO, StringIO
 import csv
 import json
 import os
+import re
+from typing import Any
 import uuid
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from openpyxl import Workbook
 from pydantic import BaseModel, Field
 
 from .errors import Text2SQLError
 from .product_auth import ProductAuthService
-from .product_models import TimeGranularity, UserContext
+from .product_models import ProductQueryResponse, TimeGranularity, UserContext
 from .product_service import ProductQueryService
 from .product_store import ProductStore
 from .service import Text2SQLService
 
 
-app = FastAPI(title="Bank Text2SQL", version="0.1.0")
+API_TAGS = [
+    {"name": "系统", "description": "健康检查与能力发现"},
+    {"name": "认证", "description": "本地演示认证；生产环境应接入银行统一认证"},
+    {"name": "智能问数", "description": "同步或流式执行自然语言数据查询"},
+    {"name": "会话", "description": "会话状态和标题管理"},
+    {"name": "历史", "description": "查询历史、详情与批量导出"},
+    {"name": "分享", "description": "限时分享查询结果"},
+    {"name": "管理", "description": "管理概览和操作审计"},
+    {"name": "兼容接口", "description": "旧版接口，仅用于兼容现有调用方"},
+]
+app = FastAPI(
+    title="Bank Text2SQL",
+    version="0.1.0",
+    description="银行智能问数标准化 API。生产环境请通过 API 网关访问。",
+    openapi_tags=API_TAGS,
+)
 cors_origins = [
     value.strip()
     for value in os.getenv(
@@ -45,9 +65,101 @@ app.add_middleware(
 )
 
 
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+ERROR_CODE_BY_STATUS = {
+    400: "REQUEST_INVALID",
+    401: "AUTH_UNAUTHORIZED",
+    403: "AUTH_FORBIDDEN",
+    404: "RESOURCE_NOT_FOUND",
+    422: "REQUEST_VALIDATION_ERROR",
+    429: "RATE_LIMITED",
+    500: "SYSTEM_ERROR",
+    504: "QUERY_TIMEOUT",
+}
+
+
+class ErrorResponse(BaseModel):
+    code: str
+    detail: Any
+    request_id: str
+
+
+ERROR_RESPONSES = {
+    status: {"model": ErrorResponse}
+    for status in (400, 401, 403, 404, 422, 500)
+}
+SSE_RESPONSES = {
+    200: {
+        "description": "Server-Sent Events stream",
+        "content": {"text/event-stream": {"schema": {"type": "string"}}},
+    },
+    **ERROR_RESPONSES,
+}
+
+
+def _new_request_id(candidate: str | None = None) -> str:
+    if candidate and REQUEST_ID_PATTERN.fullmatch(candidate):
+        return candidate
+    return uuid.uuid4().hex
+
+
+def _request_id(request: Request, preferred: str | None = None) -> str:
+    value = _new_request_id(preferred or getattr(request.state, "request_id", None))
+    request.state.request_id = value
+    return value
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request.state.request_id = _new_request_id(request.headers.get("X-Request-ID"))
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_error_response(request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": ERROR_CODE_BY_STATUS.get(exc.status_code, "REQUEST_FAILED"),
+            "detail": exc.detail,
+            "request_id": _request_id(request),
+        },
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_response(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": ERROR_CODE_BY_STATUS[422],
+            "detail": exc.errors(),
+            "request_id": _request_id(request),
+        },
+    )
+
+
 class QueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     session_id: str | None = Field(default=None, max_length=128)
+    request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+    caller_system: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
 
 
 class DrillRequest(BaseModel):
@@ -112,12 +224,17 @@ def user_context(
     )
 
 
-@app.get("/health")
+@app.get("/health", tags=["系统"], summary="健康检查")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/auth/login")
+@app.post(
+    "/api/v1/auth/login",
+    tags=["认证"],
+    summary="登录并获取访问令牌",
+    responses=ERROR_RESPONSES,
+)
 def login(request: LoginRequest) -> dict[str, object]:
     try:
         token, user = get_auth_service().login(request.username, request.password)
@@ -126,7 +243,12 @@ def login(request: LoginRequest) -> dict[str, object]:
     return {"access_token": token, "token_type": "bearer", "user": user.to_dict()}
 
 
-@app.get("/api/v1/auth/me")
+@app.get(
+    "/api/v1/auth/me",
+    tags=["认证"],
+    summary="获取当前用户",
+    responses=ERROR_RESPONSES,
+)
 def current_user(
     authorization: str | None = Header(default=None),
 ) -> dict[str, str]:
@@ -136,7 +258,12 @@ def current_user(
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/auth/logout")
+@app.post(
+    "/api/v1/auth/logout",
+    tags=["认证"],
+    summary="注销当前令牌",
+    responses=ERROR_RESPONSES,
+)
 def logout(authorization: str | None = Header(default=None)) -> dict[str, bool]:
     try:
         get_auth_service().logout(authorization)
@@ -145,7 +272,7 @@ def logout(authorization: str | None = Header(default=None)) -> dict[str, bool]:
     return {"logged_out": True}
 
 
-@app.post("/query")
+@app.post("/query", tags=["兼容接口"], summary="旧版智能问数")
 def query(request: QueryRequest) -> dict[str, object]:
     try:
         return get_service().ask(request.question, request.session_id).to_dict()
@@ -153,7 +280,11 @@ def query(request: QueryRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.delete("/sessions/{session_id}")
+@app.delete(
+    "/sessions/{session_id}",
+    tags=["兼容接口"],
+    summary="清除旧版会话",
+)
 def clear_session(session_id: str) -> dict[str, bool]:
     get_service().clear_session(session_id)
     return {"cleared": True}
@@ -167,7 +298,11 @@ def _product_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="系统处理失败")
 
 
-@app.get("/api/v1/capabilities")
+@app.get(
+    "/api/v1/capabilities",
+    tags=["系统"],
+    summary="获取服务能力",
+)
 def capabilities() -> dict[str, object]:
     return {
         "api_version": "v1",
@@ -186,7 +321,12 @@ def capabilities() -> dict[str, object]:
     }
 
 
-@app.delete("/api/v1/sessions/{session_id}")
+@app.delete(
+    "/api/v1/sessions/{session_id}",
+    tags=["会话"],
+    summary="清除会话",
+    responses=ERROR_RESPONSES,
+)
 def clear_product_session(
     session_id: str,
     delete_history: bool = Query(default=True),
@@ -209,7 +349,12 @@ def clear_product_session(
         raise _product_error(exc) from exc
 
 
-@app.patch("/api/v1/sessions/{session_id}")
+@app.patch(
+    "/api/v1/sessions/{session_id}",
+    tags=["会话"],
+    summary="重命名会话",
+    responses=ERROR_RESPONSES,
+)
 def rename_product_session(
     session_id: str,
     request: RenameSessionRequest,
@@ -231,28 +376,47 @@ def rename_product_session(
         raise _product_error(exc) from exc
 
 
-@app.post("/api/v1/queries")
+@app.post(
+    "/api/v1/queries",
+    response_model=ProductQueryResponse,
+    tags=["智能问数"],
+    summary="执行同步自然语言查询",
+    responses=ERROR_RESPONSES,
+)
 def product_query(
     request: QueryRequest,
+    http_request: Request,
     x_user_id: str = Header(default="demo-analyst", max_length=128),
     x_user_role: str = Header(default="analyst"),
     x_org_scope: str = Header(default="", max_length=2000),
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
+    integration_request_id = _request_id(http_request, request.request_id)
     user = user_context(x_user_id, x_user_role, x_org_scope, authorization)
     try:
-        return get_product_service().query(
+        response = get_product_service().query(
             request.question,
             request.session_id,
             user,
+        )
+        return replace(
+            response,
+            request_id=integration_request_id,
+            caller_system=request.caller_system,
         ).to_dict()
     except Exception as exc:
         raise _product_error(exc) from exc
 
 
-@app.post("/api/v1/queries/stream")
+@app.post(
+    "/api/v1/queries/stream",
+    tags=["智能问数"],
+    summary="流式执行自然语言查询",
+    responses=SSE_RESPONSES,
+)
 def product_query_stream(
     request: QueryRequest,
+    http_request: Request,
     x_user_id: str = Header(default="demo-analyst", max_length=128),
     x_user_role: str = Header(default="analyst"),
     x_org_scope: str = Header(default="", max_length=2000),
@@ -260,6 +424,7 @@ def product_query_stream(
 ) -> StreamingResponse:
     user = user_context(x_user_id, x_user_role, x_org_scope, authorization)
     public_session_id = request.session_id or uuid.uuid4().hex
+    integration_request_id = _request_id(http_request, request.request_id)
 
     def event_stream():
         yield _sse(
@@ -268,6 +433,7 @@ def product_query_stream(
                 "stage": "understanding",
                 "message": "正在理解问题",
                 "session_id": public_session_id,
+                "request_id": integration_request_id,
             },
         )
         try:
@@ -276,6 +442,8 @@ def product_query_stream(
                 public_session_id,
                 user,
             ).to_dict()
+            result["request_id"] = integration_request_id
+            result["caller_system"] = request.caller_system
             yield _sse("status", {"stage": "data_ready", "message": "数据查询完成"})
             yield _sse("result", result)
             yield _sse(
@@ -284,6 +452,7 @@ def product_query_stream(
                     "query_id": result["query_id"],
                     "answer_mode": result["answer_mode"],
                     "answer_status": result["answer_status"],
+                    "request_id": integration_request_id,
                 },
             )
         except Exception as exc:
@@ -299,6 +468,8 @@ def product_query_stream(
                     "status": status,
                     "message": message,
                     "session_id": public_session_id,
+                    "code": ERROR_CODE_BY_STATUS.get(status, "REQUEST_FAILED"),
+                    "request_id": integration_request_id,
                 },
             )
 
@@ -312,9 +483,15 @@ def product_query_stream(
     )
 
 
-@app.get("/api/v1/queries/{query_id}/answer/stream")
+@app.get(
+    "/api/v1/queries/{query_id}/answer/stream",
+    tags=["智能问数"],
+    summary="流式生成最终回答",
+    responses=SSE_RESPONSES,
+)
 def final_answer_stream(
     query_id: str,
+    http_request: Request,
     x_user_id: str = Header(default="demo-analyst", max_length=128),
     x_user_role: str = Header(default="analyst"),
     x_org_scope: str = Header(default="", max_length=2000),
@@ -342,6 +519,8 @@ def final_answer_stream(
                     "query_id": query_id,
                     "status": status,
                     "message": message,
+                    "code": ERROR_CODE_BY_STATUS.get(status, "REQUEST_FAILED"),
+                    "request_id": _request_id(http_request),
                 },
             )
 
@@ -355,7 +534,13 @@ def final_answer_stream(
     )
 
 
-@app.post("/api/v1/queries/{query_id}/drill")
+@app.post(
+    "/api/v1/queries/{query_id}/drill",
+    response_model=ProductQueryResponse,
+    tags=["智能问数"],
+    summary="执行时间下钻",
+    responses=ERROR_RESPONSES,
+)
 def time_drill(
     query_id: str,
     request: DrillRequest,
@@ -377,7 +562,12 @@ def time_drill(
         raise _product_error(exc) from exc
 
 
-@app.get("/api/v1/history")
+@app.get(
+    "/api/v1/history",
+    tags=["历史"],
+    summary="查询历史列表",
+    responses=ERROR_RESPONSES,
+)
 def history(
     limit: int | None = Query(default=None, ge=1, le=5000),
     keyword: str | None = Query(default=None, max_length=200),
@@ -392,7 +582,13 @@ def history(
     }
 
 
-@app.get("/api/v1/history/{query_id}")
+@app.get(
+    "/api/v1/history/{query_id}",
+    response_model=ProductQueryResponse,
+    tags=["历史"],
+    summary="查询历史详情",
+    responses=ERROR_RESPONSES,
+)
 def history_detail(
     query_id: str,
     x_user_id: str = Header(default="demo-analyst", max_length=128),
@@ -407,7 +603,12 @@ def history_detail(
         raise _product_error(exc) from exc
 
 
-@app.get("/api/v1/sessions/{session_id}/history")
+@app.get(
+    "/api/v1/sessions/{session_id}/history",
+    tags=["历史"],
+    summary="查询会话历史",
+    responses=ERROR_RESPONSES,
+)
 def session_history(
     session_id: str,
     owner_user_id: str | None = Query(default=None, max_length=128),
@@ -432,7 +633,12 @@ def session_history(
         raise _product_error(exc) from exc
 
 
-@app.get("/api/v1/history/export/batch")
+@app.get(
+    "/api/v1/history/export/batch",
+    tags=["历史"],
+    summary="批量导出历史记录",
+    responses=ERROR_RESPONSES,
+)
 def batch_export_history(
     scope: str = Query(pattern="^(all|recent|session)$"),
     recent_count: int = Query(default=20, ge=1, le=5000),
@@ -529,7 +735,12 @@ def batch_export_history(
     )
 
 
-@app.get("/api/v1/queries/{query_id}/export")
+@app.get(
+    "/api/v1/queries/{query_id}/export",
+    tags=["历史"],
+    summary="导出单次查询",
+    responses=ERROR_RESPONSES,
+)
 def export_query(
     query_id: str,
     format: str = Query(default="xlsx", pattern="^(xlsx|csv)$"),
@@ -573,7 +784,12 @@ def export_query(
     )
 
 
-@app.post("/api/v1/queries/{query_id}/share")
+@app.post(
+    "/api/v1/queries/{query_id}/share",
+    tags=["分享"],
+    summary="创建限时分享",
+    responses=ERROR_RESPONSES,
+)
 def share_query(
     query_id: str,
     request: ShareRequest,
@@ -593,7 +809,13 @@ def share_query(
         raise _product_error(exc) from exc
 
 
-@app.get("/api/v1/shares/{token}")
+@app.get(
+    "/api/v1/shares/{token}",
+    response_model=ProductQueryResponse,
+    tags=["分享"],
+    summary="访问分享结果",
+    responses=ERROR_RESPONSES,
+)
 def shared_query(
     token: str,
     x_user_id: str = Header(default="demo-viewer", max_length=128),
@@ -611,7 +833,12 @@ def shared_query(
         raise _product_error(exc) from exc
 
 
-@app.get("/api/v1/admin/overview")
+@app.get(
+    "/api/v1/admin/overview",
+    tags=["管理"],
+    summary="管理概览",
+    responses=ERROR_RESPONSES,
+)
 def admin_overview(
     x_user_id: str = Header(default="demo-admin", max_length=128),
     x_user_role: str = Header(default="admin"),
@@ -624,7 +851,12 @@ def admin_overview(
         raise _product_error(exc) from exc
 
 
-@app.get("/api/v1/admin/audit")
+@app.get(
+    "/api/v1/admin/audit",
+    tags=["管理"],
+    summary="查询操作审计",
+    responses=ERROR_RESPONSES,
+)
 def admin_audit(
     sort: str = Query(default="newest", pattern="^(newest|risk_desc|risk_asc)$"),
     risk: str = Query(default="all", pattern="^(all|elevated|low|medium|high)$"),
@@ -647,7 +879,12 @@ def admin_audit(
         raise _product_error(exc) from exc
 
 
-@app.get("/api/v1/admin/users")
+@app.get(
+    "/api/v1/admin/users",
+    tags=["管理"],
+    summary="查询审计用户",
+    responses=ERROR_RESPONSES,
+)
 def admin_users(
     x_user_id: str = Header(default="demo-admin", max_length=128),
     x_user_role: str = Header(default="admin"),
@@ -658,6 +895,43 @@ def admin_users(
         return {"items": get_product_service().admin_users(user)}
     except Exception as exc:
         raise _product_error(exc) from exc
+
+
+def custom_openapi() -> dict[str, object]:
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=app.openapi_tags,
+    )
+    components = schema.setdefault("components", {})
+    security_schemes = components.setdefault("securitySchemes", {})
+    security_schemes["BearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque-token",
+    }
+    public_operations = {
+        ("/api/v1/auth/login", "post"),
+        ("/api/v1/capabilities", "get"),
+        ("/api/v1/shares/{token}", "get"),
+    }
+    for path, path_item in schema.get("paths", {}).items():
+        if not path.startswith("/api/v1"):
+            continue
+        for method, operation in path_item.items():
+            if method not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            if (path, method) not in public_operations:
+                operation["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 
 def _sse(event: str, data: object) -> str:

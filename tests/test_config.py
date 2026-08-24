@@ -27,3 +27,30 @@ def test_process_environment_fills_missing_dotenv_values(tmp_path, monkeypatch):
     settings = Settings.from_env(env_file)
 
     assert settings.llm_url == "https://process-fallback.example/chat/completions"
+
+
+def test_llm_base_url_builds_chat_completions_endpoint(tmp_path):
+    settings = Settings(
+        xlsx_path=tmp_path / "data.xlsx",
+        db_path=tmp_path / "data.duckdb",
+        llm_base_url="https://contest.example/v1/",
+    )
+
+    assert (
+        settings.llm_chat_completions_url
+        == "https://contest.example/v1/chat/completions"
+    )
+
+
+def test_existing_full_llm_url_has_priority_over_base_url(tmp_path):
+    settings = Settings(
+        xlsx_path=tmp_path / "data.xlsx",
+        db_path=tmp_path / "data.duckdb",
+        llm_url="https://existing.example/chat/completions",
+        llm_base_url="https://contest.example/v1",
+    )
+
+    assert (
+        settings.llm_chat_completions_url
+        == "https://existing.example/chat/completions"
+    )

@@ -6,11 +6,17 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
-import requests
+import requests  # Compatibility alias for existing integrations/tests.
 
 from .business_rules import derived_rule_prompt
 from .config import Settings
 from .errors import ConfigurationError, PlanningError
+from .llm_client import (
+    ChatModelClient,
+    LLMResponseError,
+    LLMTransportError,
+    create_llm_client,
+)
 from .models import PlanFilter, QueryPlan, SessionState
 from .semantic_catalog import DERIVED_METRICS
 
@@ -208,12 +214,17 @@ def parse_llm_plan(content: str) -> QueryPlan:
 
 
 class LLMPlanner:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: ChatModelClient | None = None,
+    ) -> None:
         self.settings = settings
+        self.client = client or create_llm_client(settings)
 
     @property
     def available(self) -> bool:
-        return bool(self.settings.llm_url and self.settings.llm_api_key)
+        return self.client.available
 
     def plan(
         self,
@@ -315,51 +326,34 @@ class LLMPlanner:
         if trace is not None:
             trace.append({"stage": request_stage, "context": payload})
         try:
-            response = requests.post(
-                self.settings.llm_url,
-                headers={
-                    "Authorization": f"Bearer {self.settings.llm_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.settings.llm_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
-                    "temperature": 0,
-                    "stream": False,
-                    "enable_thinking": False,
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=self.settings.llm_timeout_seconds,
+            result = self.client.complete_json(
+                system_prompt=system_prompt,
+                payload=payload,
             )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-        except requests.RequestException as exc:
+        except LLMTransportError as exc:
             if trace is not None:
                 trace.append(
                     {
                         "stage": f"{stage_prefix}_transport_error",
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "error": str(exc),
                     }
                 )
-            raise PlanningError(f"LLM网络调用失败：{type(exc).__name__}") from exc
-        except (KeyError, TypeError, ValueError) as exc:
+            raise PlanningError(f"LLM网络调用失败：{exc.cause_type}") from exc
+        except LLMResponseError as exc:
             if trace is not None:
                 trace.append(
                     {
                         "stage": f"{stage_prefix}_response_error",
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "error": str(exc),
                     }
                 )
-            raise PlanningError(f"LLM调用失败：{type(exc).__name__}") from exc
-        raw_content = str(content)
+            raise PlanningError(f"LLM调用失败：{exc.cause_type}") from exc
+        raw_content = result.content
         if trace is not None:
             trace.append(
                 {
                     "stage": response_stage,
-                    "status_code": response.status_code,
+                    "status_code": result.status_code,
                     "content": raw_content,
                 }
             )

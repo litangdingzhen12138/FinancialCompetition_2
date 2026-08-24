@@ -99,6 +99,8 @@ class ProductQueryResponse:
     aggregation: str | None = None
     permissions: dict[str, bool] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    request_id: str | None = None
+    caller_system: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

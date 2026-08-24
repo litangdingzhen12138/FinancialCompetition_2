@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any, Iterator
 
-import requests
+import requests  # Compatibility alias for existing integrations/tests.
 
 from .config import Settings
 from .errors import ConfigurationError, FinalAnswerError
+from .llm_client import (
+    ChatModelClient,
+    LLMResponseError,
+    LLMTransportError,
+    create_llm_client,
+)
 
 
 SYSTEM_PROMPT = """你是银行数据问答助手。
@@ -28,12 +33,17 @@ SYSTEM_PROMPT = """你是银行数据问答助手。
 
 
 class FinalAnswerGenerator:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: ChatModelClient | None = None,
+    ) -> None:
         self.settings = settings
+        self.client = client or create_llm_client(settings)
 
     @property
     def available(self) -> bool:
-        return bool(self.settings.llm_url and self.settings.llm_api_key)
+        return self.client.available
 
     def stream(
         self,
@@ -67,66 +77,13 @@ class FinalAnswerGenerator:
             ],
         }
         try:
-            with requests.post(
-                self.settings.llm_url,
-                headers={
-                    "Authorization": f"Bearer {self.settings.llm_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.settings.llm_model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                context,
-                                ensure_ascii=False,
-                                default=str,
-                            ),
-                        },
-                    ],
-                    "temperature": 0,
-                    "stream": True,
-                    "enable_thinking": False,
-                },
-                timeout=self.settings.llm_timeout_seconds,
-                stream=True,
-            ) as response:
-                response.raise_for_status()
-                response.encoding = "utf-8"
-                yielded = False
-                for line in response.iter_lines(decode_unicode=True):
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        payload = json.loads(data)
-                    except json.JSONDecodeError as exc:
-                        raise FinalAnswerError("最终回答LLM返回了无效的流式数据") from exc
-                    if not isinstance(payload, dict):
-                        raise FinalAnswerError("最终回答LLM返回了无效的流式数据")
-                    choices = payload.get("choices")
-                    if choices == []:
-                        # OpenAI-compatible APIs may end with a usage-only frame.
-                        continue
-                    if not isinstance(choices, list):
-                        raise FinalAnswerError("最终回答LLM返回了无效的流式数据")
-                    first_choice = choices[0]
-                    if not isinstance(first_choice, dict):
-                        raise FinalAnswerError("最终回答LLM返回了无效的流式数据")
-                    delta = first_choice.get("delta")
-                    if not isinstance(delta, dict):
-                        raise FinalAnswerError("最终回答LLM返回了无效的流式数据")
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        yielded = True
-                        yield content
-                if not yielded:
-                    raise FinalAnswerError("最终回答LLM未返回有效内容")
-        except requests.RequestException as exc:
+            yield from self.client.stream_text(
+                system_prompt=SYSTEM_PROMPT,
+                payload=context,
+            )
+        except LLMTransportError as exc:
             raise FinalAnswerError(
-                f"最终回答LLM网络调用失败：{type(exc).__name__}"
+                f"最终回答LLM网络调用失败：{exc.cause_type}"
             ) from exc
+        except LLMResponseError as exc:
+            raise FinalAnswerError("最终回答LLM返回了无效的流式数据") from exc

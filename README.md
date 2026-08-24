@@ -98,6 +98,10 @@ answer = run.run("江苏省A市农商行在2025年6月15日，各项存款余额
 python -m uvicorn text2sql.api:app --host 127.0.0.1 --port 8000
 ```
 
+完整的认证、请求字段、响应字段、错误码、SSE 和中台调用示例见
+[`docs/API标准化对接说明.md`](docs/API标准化对接说明.md)。启动后端后也可直接访问
+`/docs`、`/redoc` 或 `/openapi.json`。
+
 请求：
 
 ```json

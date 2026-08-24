@@ -26,10 +26,21 @@ class Settings:
     default_row_limit: int = 200
     hard_row_limit: int = 1000
     llm_url: str | None = None
+    llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str = "qwen-plus"
+    llm_provider: str = "openai_compatible"
     llm_timeout_seconds: float = 20.0
     llm_retries: int = 1
+
+    @property
+    def llm_chat_completions_url(self) -> str | None:
+        """Keep the existing full URL while also accepting an OpenAI base URL."""
+        if self.llm_url:
+            return self.llm_url
+        if self.llm_base_url:
+            return f"{self.llm_base_url.rstrip('/')}/chat/completions"
+        return None
 
     @classmethod
     def from_env(cls, env_file: Path | None = None) -> "Settings":
@@ -50,8 +61,12 @@ class Settings:
             default_row_limit=int(os.getenv("TEXT2SQL_DEFAULT_ROW_LIMIT", "200")),
             hard_row_limit=int(os.getenv("TEXT2SQL_HARD_ROW_LIMIT", "1000")),
             llm_url=os.getenv("TEXT2SQL_LLM_URL"),
+            llm_base_url=os.getenv("TEXT2SQL_LLM_BASE_URL"),
             llm_api_key=os.getenv("TEXT2SQL_LLM_API_KEY"),
             llm_model=os.getenv("TEXT2SQL_LLM_MODEL", "qwen-plus"),
+            llm_provider=os.getenv(
+                "TEXT2SQL_LLM_PROVIDER", "openai_compatible"
+            ),
             llm_timeout_seconds=float(os.getenv("TEXT2SQL_LLM_TIMEOUT", "20")),
             llm_retries=int(os.getenv("TEXT2SQL_LLM_RETRIES", "1")),
         )

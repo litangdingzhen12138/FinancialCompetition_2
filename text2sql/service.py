@@ -10,7 +10,7 @@ from .answerer import format_answer, has_deterministic_answer
 from .business_rules import PROVINCE_ORGANIZATION_COUNT
 from .config import Settings
 from .context_router import ContextDecision, ContextRouter
-from .data_builder import ensure_database
+from .datasource import DataSourceAdapter, DuckDBDataSourceAdapter
 from .date_resolver import comparison_date
 from .errors import (
     ClarificationError,
@@ -21,7 +21,6 @@ from .errors import (
     ValidationError,
     retry_feedback,
 )
-from .executor import DuckDBExecutor
 from .llm_planner import LLMPlanner
 from .models import QueryPlan, QueryResponse, QueryResult, SessionState
 from .pending_query import (
@@ -30,7 +29,7 @@ from .pending_query import (
     should_start_pending,
 )
 from .rule_planner import RuleDecision, RulePlanner
-from .semantic_catalog import LOWER_IS_BETTER, SemanticCatalog
+from .semantic_catalog import LOWER_IS_BETTER
 from .session_store import InMemorySessionStore
 from .sql_compiler import compile_global_rank_sql, compile_rule_sql
 from .validators import (
@@ -49,10 +48,14 @@ class Text2SQLService:
         settings: Settings | None = None,
         session_store: InMemorySessionStore | None = None,
         llm_planner: LLMPlanner | None = None,
+        data_source: DataSourceAdapter | None = None,
     ) -> None:
         self.settings = settings or Settings.from_env()
-        self.db_path = ensure_database(self.settings.xlsx_path, self.settings.db_path)
-        self.catalog = SemanticCatalog(self.db_path)
+        self.data_source = data_source or DuckDBDataSourceAdapter.from_settings(
+            self.settings
+        )
+        self.db_path = self.data_source.db_path
+        self.catalog = self.data_source.catalog
         self.sessions = session_store or InMemorySessionStore()
         self.context_router = ContextRouter(self.catalog)
         self.rule_planner = RulePlanner(self.catalog)
@@ -63,7 +66,7 @@ class Text2SQLService:
         self.sql_guard = SQLGuard(self.settings.default_row_limit, self.settings.hard_row_limit)
         self.alignment_validator = AlignmentValidator(self.catalog)
         self.result_validator = ResultValidator()
-        self.executor = DuckDBExecutor(self.db_path, self.settings.hard_row_limit)
+        self.executor = self.data_source
 
     def _validated_execute(
         self,
