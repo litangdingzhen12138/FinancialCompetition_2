@@ -22,17 +22,22 @@ LONG_DISTANCE_REFERENCE = re.compile(
     r"最早|一开始|最开始|很早之前|之前讨论过|回到(?:前面|最初|一开始)|前面一直"
 )
 EXPLICIT_DIALOGUE_REFERENCE = re.compile(
-    r"它们|这些机构|这几家|上述机构|它的|它在|这个(?:指标|利润|增量|水平|数值|排名|不良率)|"
+    r"它们|这些机构|这几家|上述机构|两家|双方|各自|其中|它的|它在|这个(?:指标|利润|增量|水平|数值|排名|不良率)|"
     r"对应的|上述|前面|刚才|先前|之前|一开始|最开始|回到|^那|那家|那几家"
 )
-PLURAL_REFERENCE = re.compile(r"它们|这些机构|这几家|上述机构|那几家")
+PLURAL_REFERENCE = re.compile(r"它们|这些机构|这几家|上述机构|两家|双方|各自|其中|那几家")
+ORGANIZATION_LIST_FOLLOWUP = re.compile(
+    r"^(?:(?:都|具体|分别)?是?)?(?:哪|那)几家(?:机构|银行|农商行)?[?？]?$|"
+    r"^(?:具体|分别)?(?:是)?哪些机构[?？]?$"
+)
 CONTINUATION_MARKER = re.compile(r"呢[?？]?$|同期|又怎么变|继续.*(?:上升|下降|回落)|排名变化")
 POPULATION_INTENT = re.compile(
     r"13家|哪家|哪些|多少家|有几家|前\d|后\d|前三|后三|最高|最低|最好|最差"
 )
 EXPLICIT_OPERATION = re.compile(
     r"多少|第几|排名|变化|变动|增长|增幅|差|相比|比|均值|平均|达标|满足|"
-    r"最高|最低|趋势|日均|合计|画像|评价|表现|怎么变|上升|下降|回落|改善|恶化"
+    r"最高|最低|趋势|日均|合计|画像|评价|表现|怎么变|上升|下降|回落|改善|恶化|"
+    r"等于|相加|除以|占比|比例|哪几家|哪些机构"
 )
 PROFILE_INTENT = re.compile(r"综合|整体(?:画像|风控|风险)|画像|评价|一句话总结|最优.*之一")
 
@@ -78,6 +83,7 @@ class ContextRouter:
         )
         population_intent = bool(POPULATION_INTENT.search(question))
         dialogue_reference = bool(EXPLICIT_DIALOGUE_REFERENCE.search(question))
+        list_followup = bool(ORGANIZATION_LIST_FOLLOWUP.fullmatch(question))
 
         # “同期” and change-from-focus expressions carry history only when the
         # current request does not itself provide the needed comparison anchor.
@@ -110,11 +116,24 @@ class ContextRouter:
                 or (not explicit_date and not has_period)
             )
         )
+        # A recognizable data operation that omits selected-scope anchors is a
+        # contextual continuation even when it contains no conventional pronoun.
+        # This covers questions such as “两项相加是否等于总额”.
+        missing_required_anchor = bool(
+            has_history
+            and explicit_metrics
+            and (
+                (not explicit_orgs and not population_intent)
+                or (not explicit_date and not has_period)
+            )
+        )
         needs_context = bool(
             dialogue_reference
+            or list_followup
             or comparison_needs_focus
             or missing_anchor_with_continuation
             or implicit_ellipsis
+            or missing_required_anchor
         )
 
         # A discourse word that contributes no required slot must not force
@@ -161,6 +180,7 @@ class ContextRouter:
             has_period=has_period,
             population_intent=population_intent,
             long_distance=long_distance,
+            list_followup=list_followup,
         )
         return ContextDecision(
             dependency="context_required" if allow_rule else "uncertain",
@@ -198,18 +218,32 @@ class ContextRouter:
         has_period: bool,
         population_intent: bool,
         long_distance: bool,
+        list_followup: bool,
     ) -> bool:
         # Long-distance references must use the wider history window; the last
         # focus state alone cannot prove what “一开始” referred to.
         if long_distance:
             return False
 
+        if list_followup:
+            return bool(
+                state.recent_turns
+                and state.recent_turns[-1].plan.operation in {
+                    "count_condition",
+                    "condition_members",
+                    "multi_metric_province_compare",
+                }
+            )
+
         if not explicit_metrics and len(state.last_metrics) != 1:
             return False
 
         if not explicit_orgs and not population_intent:
             if PLURAL_REFERENCE.search(question):
-                if not state.last_result_organizations:
+                inherited_orgs = state.last_result_organizations or state.last_organizations
+                if not inherited_orgs:
+                    return False
+                if "两家" in question and len(inherited_orgs) != 2:
                     return False
             else:
                 inherited_orgs = state.last_organizations or state.last_result_organizations

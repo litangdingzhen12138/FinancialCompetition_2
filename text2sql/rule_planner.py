@@ -8,10 +8,10 @@ aggregation are handed to the LLM planner instead of being encoded per question.
 from __future__ import annotations
 
 from calendar import monthrange
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 
-from .context_router import ContextRouter
+from .context_router import ContextRouter, ORGANIZATION_LIST_FOLLOWUP, PLURAL_REFERENCE
 from .date_resolver import comparison_date, resolve_date, year_beginning
 from .models import PlanFilter, QueryPlan, SessionState
 from .semantic_catalog import (
@@ -228,6 +228,52 @@ class RulePlanner:
                 )
             use_context = context.allow_context_rule
         question = normalize_question(raw_question)
+
+        if use_context and ORGANIZATION_LIST_FOLLOWUP.fullmatch(question):
+            previous_plan = state.recent_turns[-1].plan if state.recent_turns else None
+            if previous_plan and previous_plan.source == "rule" and previous_plan.operation in {
+                "count_condition",
+                "condition_members",
+                "multi_metric_province_compare",
+            }:
+                operation = (
+                    "condition_members"
+                    if previous_plan.operation in {"count_condition", "condition_members"}
+                    else previous_plan.operation
+                )
+                plan = replace(
+                    previous_plan,
+                    query_type="condition_members",
+                    operation=operation,
+                    expected_shape="multi_row",
+                    allow_empty=True,
+                    assumptions=tuple(
+                        dict.fromkeys(
+                            assumption
+                            for assumption in (
+                                *previous_plan.assumptions,
+                                "organization_list_only",
+                                "require_organization_list",
+                            )
+                            if assumption != "require_organization_count"
+                        )
+                    ),
+                    rule_id="condition_members_followup_v1",
+                    confidence=0.99,
+                    sql=None,
+                )
+                return RuleDecision(
+                    plan,
+                    {
+                        "organizations": plan.organizations,
+                        "organization_scope": plan.organization_scope,
+                        "metrics": plan.metrics,
+                        "current_date": plan.current_date,
+                        "context_used": True,
+                    },
+                    "上一轮条件查询的机构名单投影",
+                )
+
         explicit_orgs = self.catalog.resolve_organizations(question)
         population_intent = bool(
             re.search(r"哪家|哪些|多少家|有几家|前\d|后\d|前三|后三|最高的?[一二三\d]|最低的?[一二三\d]", question)
@@ -235,7 +281,19 @@ class RulePlanner:
 
         organizations = explicit_orgs
         inherited_orgs = False
-        if not organizations and use_context:
+        linked_explicit_org = bool(
+            explicit_orgs
+            and re.search(
+                r"(?:它|该行|这个机构).*(?:和|与|跟)|(?:和|与|跟).*(?:它|该行|这个机构)",
+                question,
+            )
+        )
+        if use_context and linked_explicit_org:
+            focus = state.last_organizations or state.last_result_organizations
+            if len(focus) == 1:
+                organizations = tuple(dict.fromkeys((*focus, *explicit_orgs)))
+                inherited_orgs = len(organizations) > len(explicit_orgs)
+        elif not organizations and use_context:
             organizations = state.last_result_organizations or state.last_organizations
             inherited_orgs = bool(organizations)
 
@@ -309,7 +367,24 @@ class RulePlanner:
         asks_selected_rank = bool(organizations) and bool(
             re.search(r"第几|排名如何|排名中|排名上", question)
         )
-        all_scope = asks_population or (
+        previous_plan = state.recent_turns[-1].plan if use_context and state.recent_turns else None
+        previous_selected_group = bool(
+            previous_plan
+            and previous_plan.organization_scope == "selected"
+            and len(previous_plan.organizations) >= 2
+        )
+        bounded_candidate_scope = bool(
+            len(organizations) >= 2
+            and (
+                len(explicit_orgs) >= 2
+                or linked_explicit_org
+                or (
+                    inherited_orgs
+                    and (PLURAL_REFERENCE.search(question) or previous_selected_group)
+                )
+            )
+        )
+        all_scope = (asks_population and not bounded_candidate_scope) or (
             bool(re.search(r"全省|13家", question))
             and not organizations
             and not asks_selected_rank
@@ -371,6 +446,9 @@ class RulePlanner:
         asks_joint_condition = bool(re.search(r"同时满足|且.*(?:均值|平均)", question))
         asks_province_average = bool(re.search(r"全省(?:均值|平均)|省均值|平均水平", question))
         asks_count = bool(re.search(r"多少家|有几家|多少天", question))
+        asks_organization_list = bool(
+            re.search(r"哪几家|哪些机构|分别.*(?:哪家|谁)|都是(?:哪|那)几家", question)
+        )
         asks_sum = bool(re.search(r"合计|总额|加起来|相加|总和", question))
         asks_difference = bool(
             re.search(r"差多少|相差|多多少|少多少|高多少|低多少|回落.*多少|减少.*多少|比.*(?:多|少|高|低).*多少", question)
@@ -393,6 +471,25 @@ class RulePlanner:
             re.search(r"(?:是否|是不是)?等于|差额", question)
             and {"ZB001", "ZB003", "ZB004"}.issubset(metrics)
         )
+        asks_npl_reconciliation = bool(
+            re.search(r"(?:是否|是不是)?等于|除以", question)
+            and {"ZB002", "ZB013", "ZB014"}.issubset(metrics)
+        )
+        asks_period_values = bool(
+            comparison_value
+            and re.search(r"分别(?:是|为)?多少|分别是多少|各(?:是|为)?多少", question)
+            and not re.search(r"变化|变动|增长|增幅|增量|增加|下降|减少|回落|相差|相比|较", question)
+        )
+        asks_pairwise_comparison = bool(
+            len(organizations) == 2
+            and len(metrics) == 1
+            and re.search(
+                r"(?:谁|哪家|哪个|那个).*(?:更高|更多|更低|更少|高|低)|"
+                r"(?:和|与|跟).*(?:比).*(?:高|低)",
+                question,
+            )
+        )
+        allow_empty = False
 
         if is_risk_profile:
             query_type, operation, expected_shape, rule_id = (
@@ -474,9 +571,12 @@ class RulePlanner:
             query_type, operation, expected_shape, rule_id = (
                 "composition", "composition", "multi_row", "composition_v1"
             )
-        elif asks_reconciliation:
+        elif asks_reconciliation or asks_npl_reconciliation:
             query_type, operation, expected_shape, rule_id = (
-                "metric_reconciliation", "reconcile", "single_row", "reconcile_v1"
+                "metric_reconciliation",
+                "reconcile",
+                "single_row" if len(organizations) == 1 else "multi_row",
+                "reconcile_v1",
             )
         elif derived_formula and asks_difference and start_date and end_date:
             return _fallback(candidates, "复合期间差值与派生比率交由LLM规划")
@@ -496,6 +596,10 @@ class RulePlanner:
                     "province_average_comparison", "province_average_compare", "province_average_v1"
                 )
                 expected_shape = "single_row" if len(organizations) == 1 and len(metrics) == 1 else "multi_row"
+        elif asks_period_values:
+            query_type, operation, expected_shape, rule_id = (
+                "period_values", "period_values", "multi_row", "period_values_v1"
+            )
         elif comparison_value:
             if re.search(r"排名变化", question) and organization_scope == "selected":
                 query_type, operation, expected_shape, rule_id = (
@@ -528,23 +632,35 @@ class RulePlanner:
                 query_type, operation, rule_id = "period_growth", "growth", "period_growth_v1"
             else:
                 query_type, operation, rule_id = "period_difference", "difference", "period_difference_v1"
+        elif threshold and asks_selected_rank:
+            if len(metrics) != 1:
+                return _fallback(candidates, "多指标排名与阈值组合交由LLM规划")
+            query_type, operation, expected_shape, rule_id = (
+                "rank_threshold", "rank_threshold", "multi_row", "rank_threshold_v1"
+            )
+            sort_direction = self.catalog.metrics[metrics[0]].sort_direction
         elif threshold:
             if len(metrics) != 1:
                 return _fallback(candidates, "多指标阈值条件交由LLM规划")
-            if asks_count:
+            if asks_count and asks_organization_list:
+                query_type, operation, expected_shape, rule_id = (
+                    "condition_members", "condition_members", "multi_row", "condition_members_v1"
+                )
+                allow_empty = True
+            elif asks_count:
                 query_type, operation, expected_shape, rule_id = (
                     "threshold_count", "count_condition", "single_row", "threshold_count_v1"
                 )
             else:
                 query_type, operation, rule_id = "threshold", "threshold", "threshold_v1"
-        elif (
-            len(organizations) == 2
-            and len(metrics) == 1
-            and asks_arithmetic
-            and re.search(r"谁.*(?:更高|更多|更低|更少)", question)
-        ):
+        elif asks_pairwise_comparison:
             query_type, operation, expected_shape, rule_id = (
-                "pairwise_difference", "value", "multi_row", "pairwise_difference_v1"
+                (
+                    "pairwise_difference" if asks_difference else "pairwise_comparison"
+                ),
+                "value",
+                "multi_row",
+                "pairwise_comparison_v1",
             )
         elif asks_difference and (
             (len(organizations) == 2 and len(metrics) == 1)
@@ -603,6 +719,7 @@ class RulePlanner:
             sort_direction=sort_direction,
             limit=limit,
             expected_shape=expected_shape,  # type: ignore[arg-type]
+            allow_empty=allow_empty,
             derived_formula=derived_formula,
             rule_id=rule_id,
             confidence=0.97,
@@ -611,8 +728,14 @@ class RulePlanner:
                     None,
                     (
                         comparison_kind,
+                        "pairwise_comparison"
+                        if query_type in {"pairwise_comparison", "pairwise_difference"}
+                        else None,
                         "pairwise_difference" if query_type == "pairwise_difference" else None,
-                        "pairwise_lower" if query_type == "pairwise_difference" and re.search(r"更低|更少", question) else None,
+                        "pairwise_lower"
+                        if query_type in {"pairwise_comparison", "pairwise_difference"}
+                        and re.search(r"更低|更少|哪个低|那个低|谁低|哪家.*低", question)
+                        else None,
                         "include_extrema" if is_trend and asks_extrema else None,
                         "include_extrema" if is_daily_average and asks_extrema else None,
                         composition_formula,
@@ -629,6 +752,7 @@ class RulePlanner:
                         else None,
                         "rank_population_all" if operation == "multi_rank" else None,
                         "rank_population_all" if operation == "multi_rank_change" else None,
+                        "rank_population_all" if operation == "rank_threshold" else None,
                         "rank_decrease" if operation == "period_change_rank" and "下降" in question else None,
                         "rank_absolute_change" if operation == "period_change_rank" and "增量" in question else None,
                         "select_highest_value" if operation == "rank" and re.search(r"最高|最多|最大", question) else None,
@@ -639,6 +763,9 @@ class RulePlanner:
                         "needs_summary" if asks_profile else None,
                         "regulatory_check" if "达标" in question or "监管" in question else None,
                         "require_organization_count" if asks_count and operation == "multi_metric_province_compare" else None,
+                        "require_organization_count" if asks_count and operation == "condition_members" else None,
+                        "require_organization_list" if asks_organization_list else None,
+                        "npl_reconciliation" if asks_npl_reconciliation else None,
                     ),
                 )
             ),

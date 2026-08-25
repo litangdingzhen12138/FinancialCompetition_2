@@ -208,7 +208,7 @@ def test_profit_deposit_ratio_uses_competition_workbook_convention(service):
 
     assert response.route == "rule"
     assert response.plan["derived_formula"] == "profit_deposit_ratio"
-    assert "232.12%" in response.answer
+    assert response.answer == "江苏省L市农商行：0.0232%"
 
 
 def test_two_explicit_dates_are_remembered_for_the_next_subject(service):
@@ -480,6 +480,19 @@ def test_relative_bottom_three_is_a_basic_rank_primitive(service, question):
     assert len(response.rows) == 3
 
 
+def test_personal_customer_count_bottom_three_keep_global_rank_numbers(service):
+    response = service.ask(
+        "截至2026年4月末，按个人客户数看，表现相对靠后的三家分别是谁？",
+        "personal-customer-bottom-three",
+    )
+
+    assert response.answer == (
+        "第13名 江苏省F市农商行：121815户；"
+        "第12名 江苏省C市农商行：130806户；"
+        "第11名 江苏省G市农商行：138252户"
+    )
+
+
 def test_last_three_wording_returns_three_rows(service):
     response = service.ask("截至2025-04-30，不良贷款率排名最后的三家是哪些？", "last-three")
     assert response.route == "rule"
@@ -611,16 +624,14 @@ def test_joint_metric_province_average_conditions_are_local_and_readable(service
     assert response.answer.count("农商行：") == 6
 
 
-def test_joint_metric_condition_count_is_answered_before_organization_details(service):
+def test_joint_metric_condition_count_returns_only_the_requested_count(service):
     response = service.ask(
         "2026年4月末同时满足不良率低于全省均值且拨备覆盖率高于全省均值的共有几家？",
         "joint-province-average-count-first",
     )
 
     assert response.route == "rule"
-    assert response.answer.startswith("共有6家，分别为：江苏省A市农商行")
-    assert response.answer.count("农商行：") == 6
-    assert not response.answer.endswith("共6家")
+    assert response.answer == "符合条件的机构共6家"
 
 
 def test_value_then_change_question_is_answered_in_the_same_order(service):

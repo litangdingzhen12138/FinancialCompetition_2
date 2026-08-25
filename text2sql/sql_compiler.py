@@ -200,6 +200,28 @@ def _threshold_sql(plan: QueryPlan) -> str:
     """
 
 
+def _rank_threshold_sql(plan: QueryPlan) -> str:
+    condition = plan.filters[0]
+    direction = (plan.sort_direction or "desc").upper()
+    return f"""
+        WITH ranked AS (
+            SELECT v.org_id, v.metric_value,
+                   RANK() OVER (ORDER BY v.metric_value {direction}) AS metric_rank
+            FROM metric_values v
+            WHERE v.data_date = DATE '{plan.current_date}'
+              AND v.metric_id = '{plan.metrics[0]}'
+        )
+        SELECT r.org_id, o.org_name, m.metric_name, m.unit,
+               r.metric_value, r.metric_rank,
+               r.metric_value {condition.operator} {float(condition.value)} AS threshold_met
+        FROM ranked r
+        JOIN organizations o ON o.org_id = r.org_id
+        JOIN metrics m ON m.metric_id = '{plan.metrics[0]}'
+        WHERE r.org_id IN ({_literals(plan.organizations)})
+        ORDER BY r.metric_rank, r.org_id
+    """
+
+
 def _threshold_count_sql(plan: QueryPlan) -> str:
     condition = plan.filters[0]
     return f"""
@@ -210,6 +232,36 @@ def _threshold_count_sql(plan: QueryPlan) -> str:
         FROM metric_values v
         WHERE v.data_date = DATE '{plan.current_date}'
           AND v.metric_id = '{plan.metrics[0]}'
+    """
+
+
+def _condition_members_sql(plan: QueryPlan) -> str:
+    condition = plan.filters[0]
+    return f"""
+        SELECT o.org_id, o.org_name, m.metric_name, m.unit, v.metric_value
+        FROM metric_values v
+        JOIN organizations o ON o.org_id = v.org_id
+        JOIN metrics m ON m.metric_id = v.metric_id
+        WHERE v.data_date = DATE '{plan.current_date}'
+          AND v.metric_id = '{plan.metrics[0]}'
+          AND v.metric_value {condition.operator} {float(condition.value)}
+        ORDER BY o.org_id
+    """
+
+
+def _period_values_sql(plan: QueryPlan) -> str:
+    return f"""
+        SELECT o.org_id, o.org_name, m.metric_name, m.unit,
+               v.data_date, v.metric_value
+        FROM metric_values v
+        JOIN organizations o ON o.org_id = v.org_id
+        JOIN metrics m ON m.metric_id = v.metric_id
+        WHERE v.metric_id = '{plan.metrics[0]}'
+          AND v.data_date IN (
+              DATE '{plan.comparison_date}', DATE '{plan.current_date}'
+          )
+          {_organization_filter(plan)}
+        ORDER BY o.org_id, v.data_date
     """
 
 
@@ -376,6 +428,28 @@ def _cross_difference_sql(plan: QueryPlan) -> str:
 
 
 def _reconcile_sql(plan: QueryPlan) -> str:
+    if "npl_reconciliation" in plan.assumptions:
+        return f"""
+            WITH values_by_org AS (
+                SELECT v.org_id,
+                       MAX(CASE WHEN v.metric_id = 'ZB013' THEN v.metric_value END) AS npl_rate,
+                       MAX(CASE WHEN v.metric_id = 'ZB014' THEN v.metric_value END) AS npl_balance,
+                       MAX(CASE WHEN v.metric_id = 'ZB002' THEN v.metric_value END) AS loan_balance
+                FROM metric_values v
+                WHERE v.data_date = DATE '{plan.current_date}'
+                  AND v.metric_id IN ('ZB002', 'ZB013', 'ZB014')
+                  {_organization_filter(plan)}
+                GROUP BY v.org_id
+            )
+            SELECT x.org_id, o.org_name,
+                   x.npl_rate, x.npl_balance, x.loan_balance,
+                   x.npl_balance / NULLIF(x.loan_balance, 0) * 100.0 AS calculated_rate,
+                   x.npl_rate - x.npl_balance / NULLIF(x.loan_balance, 0) * 100.0 AS difference_value,
+                   ABS(x.npl_rate - x.npl_balance / NULLIF(x.loan_balance, 0) * 100.0) <= 0.011 AS is_equal
+            FROM values_by_org x
+            JOIN organizations o ON o.org_id = x.org_id
+            ORDER BY x.org_id
+        """
     return f"""
         WITH values_by_org AS (
             SELECT v.org_id,
@@ -709,8 +783,14 @@ def compile_rule_sql(plan: QueryPlan) -> str:
         return _multi_metric_province_compare_sql(plan)
     if plan.operation == "threshold":
         return _threshold_sql(plan)
+    if plan.operation == "rank_threshold":
+        return _rank_threshold_sql(plan)
     if plan.operation == "count_condition":
         return _threshold_count_sql(plan)
+    if plan.operation == "condition_members":
+        return _condition_members_sql(plan)
+    if plan.operation == "period_values":
+        return _period_values_sql(plan)
     if plan.operation == "daily_average":
         return _daily_average_sql(plan)
     if plan.operation == "sum":

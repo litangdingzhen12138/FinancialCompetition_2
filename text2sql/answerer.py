@@ -100,6 +100,9 @@ _REQUIRED_COLUMNS_BY_OPERATION = {
         "org_name", "metric_value", "province_average", "difference_from_average"
     },
     "threshold": {"org_name", "metric_value", "threshold_met"},
+    "rank_threshold": {"org_name", "metric_value", "metric_rank", "threshold_met"},
+    "period_values": {"org_name", "data_date", "metric_value"},
+    "condition_members": {"org_name", "metric_value"},
     "daily_average": {"org_name", "average_value"},
     "quarterly_trend": {"org_name", "data_date", "metric_value"},
     "sum": {"metric_name", "metric_value", "total_value"},
@@ -129,9 +132,16 @@ _RULE_ANSWER_OPERATIONS = frozenset(_REQUIRED_COLUMNS_BY_OPERATION)
 def has_deterministic_answer(plan: QueryPlan, result: QueryResult) -> bool:
     """Return whether an explicit answer template covers this executed result."""
     rows = result.dictionaries()
+    if plan.operation == "condition_members" and not rows:
+        return {"org_id", "org_name"}.issubset(result.columns)
     if not rows or plan.operation not in _RULE_ANSWER_OPERATIONS:
         return False
     required_columns = _REQUIRED_COLUMNS_BY_OPERATION[plan.operation]
+    if plan.operation == "reconcile" and "npl_reconciliation" in plan.assumptions:
+        required_columns = {
+            "npl_rate", "npl_balance", "loan_balance",
+            "calculated_rate", "difference_value", "is_equal",
+        }
     if plan.operation == "count_vs_average" and plan.start_date:
         required_columns = {"matching_days", "total_days", "matching_percentage"}
     return all(required_columns.issubset(row) for row in rows)
@@ -341,7 +351,14 @@ def _format_answer_core(
 ) -> str:
     rows = result.dictionaries()
     unit = catalog.unit_for_plan(plan.metrics, plan.derived_formula)
+    if plan.operation == "condition_members" and not rows:
+        return "没有机构满足该条件"
     required_columns = _REQUIRED_COLUMNS_BY_OPERATION.get(plan.operation)
+    if plan.operation == "reconcile" and "npl_reconciliation" in plan.assumptions:
+        required_columns = {
+            "npl_rate", "npl_balance", "loan_balance",
+            "calculated_rate", "difference_value", "is_equal",
+        }
     if plan.operation == "count_vs_average" and plan.start_date:
         required_columns = {"matching_days", "total_days", "matching_percentage"}
     if required_columns and any(not required_columns.issubset(row) for row in rows):
@@ -361,13 +378,27 @@ def _format_answer_core(
                 f"（{relation_by_metric[metric_id]}全省均值"
                 f"{_value(row['province_average'], str(row.get('unit') or ''))}）"
             )
+        organization_names = "、".join(organizations)
+        requires_count = "require_organization_count" in plan.assumptions
+        requires_list = "require_organization_list" in plan.assumptions
+        if requires_count and not requires_list:
+            return f"符合条件的机构共{len(organizations)}家"
+        if requires_list:
+            return (
+                f"共有{len(organizations)}家，分别为：{organization_names}"
+                if requires_count
+                else organization_names
+            )
         answer = "；".join(
             f"{org_name}：{'，'.join(values)}"
             for org_name, values in organizations.items()
         )
-        if "require_organization_count" in plan.assumptions:
-            answer = f"共有{len(organizations)}家，分别为：{answer}"
         return answer
+    if plan.operation == "condition_members":
+        names = "、".join(str(row["org_name"]) for row in rows)
+        if "require_organization_count" in plan.assumptions:
+            return f"共有{len(rows)}家，分别为：{names}"
+        return names
     if plan.operation == "sum":
         pieces = []
         by_organization = len(plan.organizations) > 1 and len(plan.metrics) == 1
@@ -573,6 +604,19 @@ def _format_answer_core(
             f"（第{_number(profit['metric_rank'], 0)}名）"
         )
     if plan.operation == "reconcile":
+        if "npl_reconciliation" in plan.assumptions:
+            pieces = []
+            for row in rows:
+                difference = abs(float(row["difference_value"]))
+                pieces.append(
+                    f"{row['org_name']}：不良贷款率{_value(row['npl_rate'], '%')}，"
+                    f"不良贷款余额{_value(row['npl_balance'], '亿元')}÷"
+                    f"各项贷款余额{_value(row['loan_balance'], '亿元')}×100="
+                    f"{_value(row['calculated_rate'], '%')}，"
+                    f"{'按展示精度一致' if row['is_equal'] else '不一致'}"
+                    f"（差额{_number(difference)}个百分点）"
+                )
+            return "；".join(pieces)
         row = rows[0]
         unit = str(row.get("unit") or "")
         return (
@@ -583,7 +627,7 @@ def _format_answer_core(
             f"{_value(row['total_value'], unit)}，差额{_value(abs(float(row['difference_value'])), unit)}"
         )
     if plan.operation == "value":
-        if "pairwise_difference" in plan.assumptions and len(rows) == 2:
+        if "pairwise_comparison" in plan.assumptions and len(rows) == 2:
             first, second = rows
             first_value, second_value = float(first["metric_value"]), float(second["metric_value"])
             wants_lower = "pairwise_lower" in plan.assumptions
@@ -591,11 +635,13 @@ def _format_answer_core(
                 rows, key=lambda row: float(row["metric_value"])
             )
             difference_unit = "个百分点" if plan.metrics[0] in RATIO_METRICS else str(winner.get("unit") or unit)
-            return (
+            answer = (
                 f"{winner['org_name']}{'更低' if wants_lower else '更高'}，"
-                f"{_value(winner['metric_value'], str(winner.get('unit') or unit))}；"
-                f"两家相差{_number(abs(first_value - second_value))}{difference_unit}"
+                f"{_value(winner['metric_value'], str(winner.get('unit') or unit))}"
             )
+            if "pairwise_difference" in plan.assumptions:
+                answer += f"；两家相差{_number(abs(first_value - second_value))}{difference_unit}"
+            return answer
         if len(plan.metrics) > 1:
             return "；".join(
                 f"{row['metric_name']}：{_value(row['metric_value'], str(row.get('unit') or unit))}"
@@ -608,6 +654,20 @@ def _format_answer_core(
     if plan.operation == "rank":
         return "；".join(
             f"第{_number(row['metric_rank'], 0)}名 {row['org_name']}："
+            f"{_value(row['metric_value'], str(row.get('unit') or unit))}"
+            for row in rows
+        )
+    if plan.operation == "rank_threshold":
+        return "；".join(
+            f"{row['org_name']}：{row['metric_name']}"
+            f"{_value(row['metric_value'], str(row.get('unit') or unit))}，"
+            f"全省第{_number(row['metric_rank'], 0)}名；"
+            f"{'达到' if row['threshold_met'] else '未达到'}要求"
+            for row in rows
+        )
+    if plan.operation == "period_values":
+        return "；".join(
+            f"{row['org_name']} {row['data_date']}："
             f"{_value(row['metric_value'], str(row.get('unit') or unit))}"
             for row in rows
         )
@@ -845,7 +905,11 @@ def format_answer(
 ) -> str:
     answer = _format_answer_core(plan, result, catalog, question)
     facts = _collect_metric_facts(plan, result, history, catalog)
-    if re.search(r"达标|监管(?:线|要求|标准|上限)", question) and len(plan.metrics) == 1:
+    if (
+        plan.operation != "rank_threshold"
+        and re.search(r"达标|监管(?:线|要求|标准|上限)", question)
+        and len(plan.metrics) == 1
+    ):
         thresholds = {"ZB013": ("低于", 5.0, "上限"), "ZB015": ("不低于", 150.0, "要求"), "ZB016": ("不低于", 10.5, "要求")}
         rule = thresholds.get(plan.metrics[0])
         fact = facts.get(plan.metrics[0])

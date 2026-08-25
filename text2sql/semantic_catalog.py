@@ -99,7 +99,8 @@ DERIVED_METRICS: dict[str, dict[str, str | tuple[str, ...]]] = {
         "numerator": "ZB011",
         "denominator": "ZB001",
         "unit": "%",
-        "multiplier": "100.0",
+        # 净利润为万元、存款为亿元：先统一为亿元，再换算为百分比。
+        "multiplier": "0.01",
     },
     "deposit_per_branch": {
         "aliases": ("网点平均存款规模", "平均存款规模（万元/网点）", "平均存款规模(万元/网点)"),

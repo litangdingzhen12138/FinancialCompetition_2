@@ -28,7 +28,8 @@ ALLOWED_OPERATIONS = {
     "cross_difference", "period_rank_extremes", "period_extrema",
     "multi_period_change", "period_change_rank", "multi_rank",
     "multi_rank_change", "three_dimension_profile", "reconcile",
-    "multi_metric_province_compare",
+    "multi_metric_province_compare", "rank_threshold", "period_values",
+    "condition_members",
 }
 EXTERNAL_ACCESS = re.compile(
     r"\b(read_csv(?:_auto)?|read_parquet|read_json(?:_auto)?|read_xlsx|sqlite_scan|postgres_scan|httpfs|glob)\s*\(",
@@ -43,6 +44,7 @@ ANSWER_OBLIGATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("difference", re.compile(r"差多少|相差|变化了多少|变动了多少|增减了多少|增长了多少钱|回落了多少|高多少|低多少|多多少|少多少")),
     ("threshold", re.compile(r"达标|监管(?:线|要求|上限|下限)|满足.*要求|是否.*(?:高于|低于|达到|超过|不超过).*\d+(?:\.\d+)?%?")),
     ("count", re.compile(r"多少家|有几家|一共有几家|多少天")),
+    ("organization_list", re.compile(r"哪几家|哪些机构|都是(?:哪|那)几家")),
     ("profile", re.compile(r"综合(?:评价|判断|来看)|整体(?:画像|风控|风险)|画像|一句话总结|最优.*之一")),
     ("extrema", re.compile(r"最高日|最低日|单日最高|单日最低|最高.*最低|最低.*最高")),
     ("trend", re.compile(r"逐季(?:变化|趋势|数据|如何|怎么样|是)|按季(?:展示|列出|分析)|季度(?:序列|趋势)|趋势")),
@@ -70,7 +72,7 @@ class AnswerCoverageValidator:
 
     _RANK_OPERATIONS = {
         "rank", "period_change_rank", "multi_rank", "multi_rank_change",
-        "period_rank_extremes", "profile", "three_dimension_profile",
+        "period_rank_extremes", "profile", "three_dimension_profile", "rank_threshold",
     }
     _AVERAGE_OPERATIONS = {
         "province_average_compare", "count_vs_average", "multi_metric_province_compare",
@@ -80,7 +82,8 @@ class AnswerCoverageValidator:
         "mom_yoy", "multi_period_change", "period_change_rank", "multi_rank_change",
     }
     _THRESHOLD_OPERATIONS = {
-        "threshold", "count_condition", "multi_metric_province_compare",
+        "threshold", "count_condition", "condition_members",
+        "multi_metric_province_compare", "rank_threshold",
     }
     _COUNT_OPERATIONS = {
         "count_condition", "count_vs_average", "multi_metric_province_compare",
@@ -115,6 +118,12 @@ class AnswerCoverageValidator:
             supported.add("threshold")
         if operation in self._COUNT_OPERATIONS or "require_organization_count" in plan.assumptions:
             supported.add("count")
+        if (
+            operation == "condition_members"
+            or operation in self._RANK_OPERATIONS
+            or "require_organization_list" in plan.assumptions
+        ):
+            supported.add("organization_list")
         if operation in self._PROFILE_OPERATIONS or "needs_summary" in plan.assumptions:
             supported.add("profile")
         if operation in self._EXTREMA_OPERATIONS or "include_extrema" in plan.assumptions:
@@ -216,6 +225,7 @@ class PlanValidator:
                     raise ValidationError(f"非法日期：{value}") from exc
         if plan.operation in {
             "value", "rank", "ratio", "province_average_compare", "threshold",
+            "rank_threshold", "period_values", "condition_members",
             "sum", "composition", "profile",
             "cross_difference", "multi_rank",
             "multi_rank_change", "three_dimension_profile", "reconcile",
@@ -224,6 +234,8 @@ class PlanValidator:
             raise ValidationError("查询缺少当前日期")
         if plan.operation in {"difference", "growth"} and (not plan.current_date or not plan.comparison_date):
             raise ValidationError("期间比较缺少当前日期或比较日期")
+        if plan.operation == "period_values" and (not plan.current_date or not plan.comparison_date):
+            raise ValidationError("两期数值查询缺少当前日期或比较日期")
         if plan.operation == "growth" and any(metric in RATIO_METRICS for metric in plan.metrics):
             raise ValidationError("比率类指标不计算增幅，应计算百分点差")
         if plan.operation == "ratio" and (len(plan.metrics) != 2 or not plan.derived_formula):
@@ -266,7 +278,7 @@ class PlanValidator:
             )
         ):
             raise ValidationError("多指标省均值联合条件不完整")
-        if plan.operation == "rank":
+        if plan.operation in {"rank", "rank_threshold"}:
             if len(plan.metrics) != 1:
                 raise ValidationError("单次排名只能包含一个指标")
             expected_direction = self.catalog.metrics[plan.metrics[0]].sort_direction
@@ -372,7 +384,7 @@ class AlignmentValidator:
                 if org.upper() not in upper:
                     raise ValidationError(f"SQL遗漏机构：{org}")
         required_dates: list[str | None] = [plan.current_date]
-        if plan.operation in {"difference", "growth"} or (
+        if plan.operation in {"difference", "growth", "period_values"} or (
             plan.operation == "multi_condition" and plan.comparison_date
         ):
             required_dates.append(plan.comparison_date)
@@ -389,7 +401,7 @@ class AlignmentValidator:
         for value in required_dates:
             if value and value not in sql:
                 raise ValidationError(f"SQL遗漏日期条件：{value}")
-        if plan.operation == "rank":
+        if plan.operation in {"rank", "rank_threshold"}:
             if not any(True for _ in expression.find_all(exp.Rank)):
                 raise ValidationError("排名SQL必须按照衍生维度说明使用RANK算法")
             orders = list(expression.find_all(exp.Ordered))
@@ -456,7 +468,7 @@ class ResultValidator:
                 rank_index = result.columns.index("metric_rank")
                 if any(row[rank_index] is None or int(row[rank_index]) > plan.limit for row in result.rows):
                     raise ResultValidationError("结果包含Top-N范围之外的排名")
-        if plan.source == "rule" and plan.operation == "rank" and "metric_rank" not in result.columns:
+        if plan.source == "rule" and plan.operation in {"rank", "rank_threshold"} and "metric_rank" not in result.columns:
             raise ResultValidationError("排名结果缺少metric_rank")
         if plan.source == "rule" and plan.operation == "ratio" and "derived_value" not in result.columns:
             raise ResultValidationError("派生比率结果缺少derived_value")
@@ -480,10 +492,18 @@ class ResultValidator:
             "multi_rank_change": {"metric_id", "previous_rank", "current_rank", "rank_change"},
             "three_dimension_profile": {"metric_id", "metric_value", "metric_rank"},
             "reconcile": {"corporate_value", "personal_value", "total_value", "difference_value", "is_equal"},
+            "rank_threshold": {"metric_value", "metric_rank", "threshold_met"},
+            "period_values": {"data_date", "metric_value"},
+            "condition_members": {"org_id", "org_name", "metric_value"},
             "multi_metric_province_compare": {
                 "org_name", "metric_id", "metric_value", "province_average"
             },
         }.get(plan.operation)
+        if plan.operation == "reconcile" and "npl_reconciliation" in plan.assumptions:
+            required_result_columns = {
+                "npl_rate", "npl_balance", "loan_balance",
+                "calculated_rate", "difference_value", "is_equal",
+            }
         if plan.source == "rule" and required_result_columns and not required_result_columns.issubset(result.columns):
             raise ResultValidationError(f"{plan.operation}结果字段不完整")
         if plan.source == "rule" and plan.operation == "profile" and (

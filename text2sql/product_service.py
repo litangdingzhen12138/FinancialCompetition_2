@@ -29,6 +29,7 @@ API_VERSION = "v1"
 SENSITIVE_METRICS = {"ZB013", "ZB014", "ZB015", "ZB016", "ZB017"}
 CROSS_ORGANIZATION_OPERATIONS = {
     "rank",
+    "rank_threshold",
     "province_average_compare",
     "multi_condition",
     "count_vs_average",
@@ -39,6 +40,7 @@ CROSS_ORGANIZATION_OPERATIONS = {
     "multi_rank_change",
     "three_dimension_profile",
     "multi_metric_province_compare",
+    "condition_members",
 }
 ALERT_S3_FREQUENCY = "S3_QUERY_FREQUENCY"
 ALERT_ACCESS_DENIED = "REPEATED_ACCESS_DENIED"

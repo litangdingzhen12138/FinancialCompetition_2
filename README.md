@@ -17,7 +17,7 @@
   → 同一套校验、执行与结果验证
 ```
 
-当前版本不使用 LangGraph。多轮对话通过 `session_id + 结构化SessionState` 实现；默认进程内存储，后续可以将 `InMemorySessionStore` 替换为 Redis。
+多轮对话通过 `session_id + 结构化SessionState` 实现；默认进程内存储，后续可以将 `InMemorySessionStore` 替换为 Redis。
 
 ## 账户密码
 
