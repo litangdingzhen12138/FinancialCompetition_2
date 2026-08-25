@@ -409,6 +409,18 @@ def test_pairwise_comparison_answers_both_winner_and_gap(service):
     assert "两家相差78.03亿元" in response.answer
 
 
+def test_superlative_ranks_only_within_explicit_candidate_organizations(service):
+    response = service.ask(
+        "江苏省D市农商行、江苏省H市农商行、江苏省L市农商行三家，"
+        "2025年8月末谁的净利润最高？",
+        "selected-candidate-ranking",
+    )
+
+    assert response.route == "rule"
+    assert "rank_population_all" not in response.plan["assumptions"]
+    assert response.answer == "第1名 江苏省L市农商行：204.44万元"
+
+
 @pytest.mark.parametrize(
     ("question", "expected"),
     [
@@ -439,6 +451,17 @@ def test_additional_derived_metric_aliases(service):
     assert "101.49万元" not in per_employee.answer
     assert npl_share.route == "rule"
     assert npl_share.answer == "江苏省D市农商行：1.6%"
+
+
+def test_ratio_denominator_total_is_not_misread_as_a_sum_obligation(service):
+    response = service.ask(
+        "江苏省K市农商行2025年12月31日，不良贷款余额占贷款总额的比重大不大？",
+        "ratio-total-denominator",
+    )
+
+    assert response.route == "rule"
+    assert response.plan["operation"] == "ratio"
+    assert response.answer == "江苏省K市农商行：1.28%"
 
 
 @pytest.mark.parametrize(

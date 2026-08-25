@@ -1,4 +1,5 @@
 import type {
+  ActiveFreeze,
   AuditItem,
   SecurityAlert,
   AnswerMode,
@@ -521,5 +522,23 @@ export async function resolveSecurityAlert(alertId: string): Promise<void> {
     headers: { ...authHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify({ status: "resolved" }),
   });
+  if (!response.ok) throw new Error(await errorMessage(response));
+}
+
+export async function getActiveFreezes(): Promise<ActiveFreeze[]> {
+  const response = await fetch(`${API_BASE}/api/v1/admin/freezes`, {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  const payload = (await response.json()) as { items: ActiveFreeze[] };
+  return payload.items;
+}
+
+export async function unfreezeUser(userId: string): Promise<void> {
+  const response = await fetch(
+    `${API_BASE}/api/v1/admin/freezes/${encodeURIComponent(userId)}`,
+    { method: "DELETE", headers: authHeaders() },
+  );
   if (!response.ok) throw new Error(await errorMessage(response));
 }

@@ -905,6 +905,34 @@ class ProductQueryService:
             user_id=user_id,
         )
 
+    def admin_freezes(self, user: UserContext) -> list[dict[str, Any]]:
+        self._require_admin(user)
+        return self.store.list_active_freezes(now=self._now_datetime())
+
+    def unfreeze_user(
+        self,
+        target_user_id: str,
+        user: UserContext,
+    ) -> dict[str, object]:
+        self._require_admin(user)
+        freeze = self.store.unfreeze_user(
+            target_user_id,
+            now=self._now_datetime(),
+        )
+        if freeze is None:
+            raise ValueError(f"用户 {target_user_id} 当前未被冻结")
+        self._audit(
+            user,
+            "user.unfrozen",
+            "low",
+            {
+                "target_user_id": target_user_id,
+                "previous_frozen_until": freeze["frozen_until"],
+                "previous_reason": freeze["reason"],
+            },
+        )
+        return {"user_id": target_user_id, "unfrozen": True}
+
     def update_alert_status(
         self,
         alert_id: str,

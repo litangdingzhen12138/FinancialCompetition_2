@@ -46,7 +46,7 @@ ANSWER_OBLIGATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("profile", re.compile(r"综合(?:评价|判断|来看)|整体(?:画像|风控|风险)|画像|一句话总结|最优.*之一")),
     ("extrema", re.compile(r"最高日|最低日|单日最高|单日最低|最高.*最低|最低.*最高")),
     ("trend", re.compile(r"逐季(?:变化|趋势|数据|如何|怎么样|是)|按季(?:展示|列出|分析)|季度(?:序列|趋势)|趋势")),
-    ("sum", re.compile(r"合计|总额|加起来|相加|总和")),
+    ("sum", re.compile(r"合计|加起来|相加|总和")),
 )
 
 

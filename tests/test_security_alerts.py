@@ -290,6 +290,45 @@ def test_admin_can_list_and_resolve_alerts(service, tmp_path, monkeypatch) -> No
     assert product.admin_alerts(admin, status="resolved")[0]["alert_id"] == alert_id
 
 
+def test_admin_can_list_and_unfreeze_account_with_audit(
+    service,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 24, 2, 0, tzinfo=timezone.utc)
+    product = _product(service, tmp_path, monkeypatch, now)
+    admin = UserContext("admin", "admin")
+    ordinary_user = UserContext("ordinary-user", "analyst")
+    product.store.freeze_user(
+        user_id="frozen-user",
+        frozen_until=now + timedelta(minutes=15),
+        reason="测试冻结",
+        updated_at=now,
+    )
+
+    assert product.admin_freezes(admin)[0]["user_id"] == "frozen-user"
+    with pytest.raises(PermissionError, match="仅管理员"):
+        product.unfreeze_user("frozen-user", ordinary_user)
+
+    result = product.unfreeze_user("frozen-user", admin)
+    assert result == {"user_id": "frozen-user", "unfrozen": True}
+    assert product.admin_freezes(admin) == []
+    audit = next(
+        item
+        for item in product.store.list_audit()
+        if item["action"] == "user.unfrozen"
+    )
+    assert audit["action"] == "user.unfrozen"
+    assert audit["details"] == {
+        "target_user_id": "frozen-user",
+        "previous_frozen_until": (now + timedelta(minutes=15)).isoformat(),
+        "previous_reason": "测试冻结",
+    }
+
+    with pytest.raises(ValueError, match="当前未被冻结"):
+        product.unfreeze_user("missing-user", admin)
+
+
 def test_frozen_share_creator_disables_existing_share(
     service,
     tmp_path,

@@ -931,6 +931,46 @@ class ProductStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_active_freezes(
+        self,
+        *,
+        now: str | datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM user_freezes
+                WHERE frozen_until > ?
+                ORDER BY frozen_until DESC, user_id ASC
+                """,
+                (_iso(now),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def unfreeze_user(
+        self,
+        user_id: str,
+        *,
+        now: str | datetime | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = _iso(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM user_freezes
+                WHERE user_id = ? AND frozen_until > ?
+                """,
+                (user_id, timestamp),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "DELETE FROM user_freezes WHERE user_id = ?",
+                (user_id,),
+            )
+        return dict(row)
+
     def list_audit_users(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(

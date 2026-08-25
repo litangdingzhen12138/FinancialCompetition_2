@@ -111,3 +111,11 @@ export type SecurityAlert = {
   created_at: string;
   updated_at: string;
 };
+
+export type ActiveFreeze = {
+  user_id: string;
+  frozen_until: string;
+  reason: string;
+  alert_id: string | null;
+  updated_at: string;
+};

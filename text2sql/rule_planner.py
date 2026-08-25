@@ -622,7 +622,11 @@ class RulePlanner:
                         "performance_profile" if is_risk_profile else None,
                         "risk_profile" if is_risk_profile else None,
                         "rank_population_all" if "第几" in question and organization_scope == "selected" else None,
-                        "rank_population_all" if operation == "rank" and organization_scope == "selected" else None,
+                        "rank_population_all"
+                        if operation == "rank"
+                        and organization_scope == "selected"
+                        and len(organizations) == 1
+                        else None,
                         "rank_population_all" if operation == "multi_rank" else None,
                         "rank_population_all" if operation == "multi_rank_change" else None,
                         "rank_decrease" if operation == "period_change_rank" and "下降" in question else None,

@@ -109,6 +109,12 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
   assert.doesNotMatch(queryResult, /规则回答|查看查询逻辑|trust-card/);
   assert.match(adminView, /risk_desc/);
   assert.match(adminView, /中高风险/);
+  assert.match(adminView, /getActiveFreezes/);
+  assert.match(adminView, /unfreezeUser/);
+  assert.match(adminView, /当前冻结账号/);
+  assert.match(adminView, /item\.details\.question/);
+  assert.doesNotMatch(adminView, /item\.details\.answer/);
+  assert.match(api, /\/api\/v1\/admin\/freezes/);
   assert.doesNotMatch(adminView, /permission-card|管理与审计|CONTROL CENTER/);
   assert.doesNotMatch(historyView, /QUERY ARCHIVE|<h1>历史报告/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

@@ -138,3 +138,38 @@ def test_admin_audit_user_query_parameter_filters_without_shadowing_context(
         "risk_level": "elevated",
         "audit_user": "analyst2",
     }
+
+
+def test_admin_freeze_endpoints_contract(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class StubProductService:
+        def admin_freezes(self, user):
+            captured["list_user"] = user.user_id
+            return [{"user_id": "analyst2", "frozen_until": "later"}]
+
+        def unfreeze_user(self, user_id, user):
+            if user_id == "missing-user":
+                raise ValueError("用户 missing-user 当前未被冻结")
+            captured.update(target_user=user_id, admin_user=user.user_id)
+            return {"user_id": user_id, "unfrozen": True}
+
+    monkeypatch.setattr(api, "get_product_service", lambda: StubProductService())
+    client = TestClient(api.app)
+    headers = {"X-User-Id": "admin", "X-User-Role": "admin"}
+
+    listed = client.get("/api/v1/admin/freezes", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["user_id"] == "analyst2"
+
+    unfrozen = client.delete("/api/v1/admin/freezes/analyst2", headers=headers)
+    assert unfrozen.status_code == 200
+    assert unfrozen.json() == {"user_id": "analyst2", "unfrozen": True}
+    missing = client.delete("/api/v1/admin/freezes/missing-user", headers=headers)
+    assert missing.status_code == 400
+    assert missing.json()["detail"] == "用户 missing-user 当前未被冻结"
+    assert captured == {
+        "list_user": "admin",
+        "target_user": "analyst2",
+        "admin_user": "admin",
+    }

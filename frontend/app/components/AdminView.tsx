@@ -2,14 +2,21 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  getActiveFreezes,
   getAdminOverview,
   getAdminUsers,
   getAudit,
   getSecurityAlerts,
   resolveSecurityAlert,
+  unfreezeUser,
   type AdminOverview,
 } from "../lib/api";
-import type { AdminUserSummary, AuditItem, SecurityAlert } from "../types";
+import type {
+  ActiveFreeze,
+  AdminUserSummary,
+  AuditItem,
+  SecurityAlert,
+} from "../types";
 
 type AuditSort = "newest" | "risk_desc" | "risk_asc";
 type RiskFilter = "all" | "elevated" | "low" | "medium" | "high";
@@ -17,6 +24,7 @@ type UserPanel = "all" | "risk" | null;
 type AuditChainStatus = "loading" | "valid" | "invalid" | "error";
 
 const actionLabels: Record<string, string> = {
+  "query.requested": "发起查询",
   "query.completed": "查询完成",
   "query.failed": "查询失败",
   "query.time_drill": "时间下钻",
@@ -25,6 +33,7 @@ const actionLabels: Record<string, string> = {
   "answer.completed": "回答完成",
   "history.batch_exported": "批量导出历史",
   "share.viewed": "查看分享",
+  "user.unfrozen": "管理员解冻",
   session_clear: "清除会话",
 };
 
@@ -46,13 +55,20 @@ const alertRuleLabels: Record<string, string> = {
   MULTI_METRIC_QUERY: "单次查询指标过多",
 };
 
+function auditQuestion(item: AuditItem): string {
+  const question = item.details.question;
+  return typeof question === "string" && question.trim() ? question : "—";
+}
+
 export function AdminView() {
   const [overview, setOverview] = useState<AdminOverview>({});
   const [users, setUsers] = useState<AdminUserSummary[]>([]);
   const [audit, setAudit] = useState<AuditItem[]>([]);
   const [alerts, setAlerts] = useState<SecurityAlert[]>([]);
+  const [freezes, setFreezes] = useState<ActiveFreeze[]>([]);
   const [auditChainStatus, setAuditChainStatus] = useState<AuditChainStatus>("loading");
   const [resolvingAlertId, setResolvingAlertId] = useState("");
+  const [unfreezingUserId, setUnfreezingUserId] = useState("");
   const [sort, setSort] = useState<AuditSort>("newest");
   const [risk, setRisk] = useState<RiskFilter>("all");
   const [selectedUser, setSelectedUser] = useState("");
@@ -63,30 +79,36 @@ export function AdminView() {
 
   useEffect(() => {
     let active = true;
-    Promise.allSettled([getAdminOverview(), getAdminUsers(), getSecurityAlerts()])
-      .then(([summaryResult, usersResult, alertsResult]) => {
-        if (!active) return;
-        const failures: string[] = [];
-        if (summaryResult.status === "fulfilled") {
-          setOverview(summaryResult.value);
-          setAuditChainStatus(
-            summaryResult.value.audit_chain_valid === true ? "valid" : "invalid",
-          );
-        } else {
-          setAuditChainStatus("error");
-          failures.push("管理概览");
-        }
-        if (usersResult.status === "fulfilled") setUsers(usersResult.value);
-        else failures.push("用户列表");
-        if (alertsResult.status === "fulfilled") {
-          setAlerts(alertsResult.value);
-          setOverview((current) => ({
-            ...current,
-            open_alert_count: alertsResult.value.length,
-          }));
-        } else failures.push("安全告警");
-        if (failures.length) setError(`${failures.join("、")}加载失败`);
-      });
+    Promise.allSettled([
+      getAdminOverview(),
+      getAdminUsers(),
+      getSecurityAlerts(),
+      getActiveFreezes(),
+    ]).then(([summaryResult, usersResult, alertsResult, freezesResult]) => {
+      if (!active) return;
+      const failures: string[] = [];
+      if (summaryResult.status === "fulfilled") {
+        setOverview(summaryResult.value);
+        setAuditChainStatus(
+          summaryResult.value.audit_chain_valid === true ? "valid" : "invalid",
+        );
+      } else {
+        setAuditChainStatus("error");
+        failures.push("管理概览");
+      }
+      if (usersResult.status === "fulfilled") setUsers(usersResult.value);
+      else failures.push("用户列表");
+      if (alertsResult.status === "fulfilled") {
+        setAlerts(alertsResult.value);
+        setOverview((current) => ({
+          ...current,
+          open_alert_count: alertsResult.value.length,
+        }));
+      } else failures.push("安全告警");
+      if (freezesResult.status === "fulfilled") setFreezes(freezesResult.value);
+      else failures.push("冻结账号");
+      if (failures.length) setError(`${failures.join("、")}加载失败`);
+    });
 
     const alertTimer = window.setInterval(() => {
       getSecurityAlerts()
@@ -251,6 +273,20 @@ export function AdminView() {
     }
   }
 
+  async function unfreeze(userId: string) {
+    if (unfreezingUserId) return;
+    setUnfreezingUserId(userId);
+    setError("");
+    try {
+      await unfreezeUser(userId);
+      setFreezes((items) => items.filter((item) => item.user_id !== userId));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "账号解冻失败");
+    } finally {
+      setUnfreezingUserId("");
+    }
+  }
+
   return (
     <section>
       <div className="page-toolbar admin-toolbar">
@@ -327,6 +363,48 @@ export function AdminView() {
       )}
 
       <div className="admin-grid">
+        <section className="audit-card frozen-account-card">
+          <div className="card-head audit-head">
+            <div>
+              <p className="section-kicker">FROZEN ACCOUNTS</p>
+              <h2>当前冻结账号</h2>
+            </div>
+            <span>共 {freezes.length} 个</span>
+          </div>
+          <div className="audit-table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>账号</th>
+                  <th>冻结原因</th>
+                  <th>冻结至</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {freezes.length === 0 && (
+                  <tr><td colSpan={4} className="table-empty">当前没有冻结账号。</td></tr>
+                )}
+                {freezes.map((item) => (
+                  <tr key={item.user_id}>
+                    <td>{item.user_id}</td>
+                    <td>{item.reason}</td>
+                    <td>{new Date(item.frozen_until).toLocaleString("zh-CN")}</td>
+                    <td>
+                      <button
+                        type="button"
+                        disabled={Boolean(unfreezingUserId)}
+                        onClick={() => unfreeze(item.user_id)}
+                      >
+                        {unfreezingUserId === item.user_id ? "解冻中…" : "解冻"}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
         <section className="audit-card security-alert-card">
           <div className="card-head audit-head">
             <div>
@@ -431,6 +509,7 @@ export function AdminView() {
                   <th>时间</th>
                   <th>用户</th>
                   <th>操作</th>
+                  <th>具体问题</th>
                   <th>风险</th>
                   <th>查询编号</th>
                 </tr>
@@ -438,7 +517,7 @@ export function AdminView() {
               <tbody>
                 {!auditLoading && audit.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="table-empty">
+                    <td colSpan={6} className="table-empty">
                       当前筛选条件下没有操作记录。
                     </td>
                   </tr>
@@ -452,6 +531,7 @@ export function AdminView() {
                       </button>
                     </td>
                     <td>{actionLabels[item.action] ?? item.action}</td>
+                    <td className="audit-question">{auditQuestion(item)}</td>
                     <td>
                       <button
                         type="button"

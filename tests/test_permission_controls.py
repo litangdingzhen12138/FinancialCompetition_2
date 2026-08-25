@@ -185,7 +185,9 @@ def test_system_admin_cannot_query_export_or_share_and_history_values_are_masked
     with pytest.raises(PermissionError, match="无分享权限"):
         product.create_share("sensitive-query", admin, expires_hours=1)
 
+    assert history[0]["question"] == "查询机构指标明细"
     assert history[0]["answer"] == "查询结果数值已按权限隐藏"
+    assert detail.question == "查询机构指标明细"
     assert detail.sql is None
     assert "sql" not in detail.plan
     assert detail.records == (

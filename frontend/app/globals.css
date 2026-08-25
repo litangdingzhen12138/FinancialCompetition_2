@@ -2744,6 +2744,14 @@ td {
   font-weight: 700;
 }
 
+.audit-question {
+  min-width: 240px;
+  max-width: 420px;
+  line-height: 1.55;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .login-brand small,
 .login-eyebrow,
 .demo-account-tip,
@@ -3083,8 +3091,8 @@ td {
     margin-left: 16px;
   }
 
-  .audit-card:not(.security-alert-card) th:nth-child(5),
-  .audit-card:not(.security-alert-card) td:nth-child(5) {
+  .audit-card:not(.security-alert-card) th:nth-child(6),
+  .audit-card:not(.security-alert-card) td:nth-child(6) {
     display: none;
   }
 

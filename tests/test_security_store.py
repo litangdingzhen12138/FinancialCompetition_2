@@ -287,3 +287,37 @@ def test_user_freeze_keeps_later_expiry_and_expires(tmp_path) -> None:
         )
         is None
     )
+
+
+def test_list_and_unfreeze_only_active_accounts(tmp_path) -> None:
+    store = ProductStore(tmp_path / "admin-freezes.sqlite3")
+    store.freeze_user(
+        user_id="active-user",
+        frozen_until="2026-08-24T10:15:00+00:00",
+        reason="测试有效冻结",
+        updated_at="2026-08-24T10:00:00+00:00",
+    )
+    store.freeze_user(
+        user_id="expired-user",
+        frozen_until="2026-08-24T09:59:00+00:00",
+        reason="测试过期冻结",
+        updated_at="2026-08-24T09:45:00+00:00",
+    )
+
+    freezes = store.list_active_freezes(now="2026-08-24T10:00:00+00:00")
+    assert [item["user_id"] for item in freezes] == ["active-user"]
+
+    removed = store.unfreeze_user(
+        "active-user",
+        now="2026-08-24T10:00:00+00:00",
+    )
+    assert removed is not None
+    assert removed["reason"] == "测试有效冻结"
+    assert store.get_active_freeze(
+        "active-user",
+        now="2026-08-24T10:00:00+00:00",
+    ) is None
+    assert store.unfreeze_user(
+        "expired-user",
+        now="2026-08-24T10:00:00+00:00",
+    ) is None

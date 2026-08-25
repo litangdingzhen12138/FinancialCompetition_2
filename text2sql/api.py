@@ -1022,6 +1022,43 @@ def update_admin_alert(
 
 
 @app.get(
+    "/api/v1/admin/freezes",
+    tags=["管理"],
+    summary="查询当前冻结账号",
+    responses=ERROR_RESPONSES,
+)
+def admin_freezes(
+    x_user_id: str = Header(default="demo-admin", max_length=128),
+    x_user_role: str = Header(default="admin"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    user = user_context(x_user_id, x_user_role, "", authorization)
+    try:
+        return {"items": get_product_service().admin_freezes(user)}
+    except Exception as exc:
+        raise _product_error(exc) from exc
+
+
+@app.delete(
+    "/api/v1/admin/freezes/{user_id}",
+    tags=["管理"],
+    summary="手动解冻账号",
+    responses=ERROR_RESPONSES,
+)
+def unfreeze_admin_user(
+    user_id: str,
+    x_user_id: str = Header(default="demo-admin", max_length=128),
+    x_user_role: str = Header(default="admin"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    current_user = user_context(x_user_id, x_user_role, "", authorization)
+    try:
+        return get_product_service().unfreeze_user(user_id, current_user)
+    except Exception as exc:
+        raise _product_error(exc) from exc
+
+
+@app.get(
     "/api/v1/admin/users",
     tags=["管理"],
     summary="查询审计用户",
