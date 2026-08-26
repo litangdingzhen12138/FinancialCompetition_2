@@ -31,6 +31,10 @@ ORGANIZATION_LIST_FOLLOWUP = re.compile(
     r"^(?:具体|分别)?(?:是)?哪些机构[?？]?$"
 )
 CONTINUATION_MARKER = re.compile(r"呢[?？]?$|同期|又怎么变|继续.*(?:上升|下降|回落)|排名变化")
+ALL_ORGANIZATION_SCOPE = re.compile(
+    r"全省|江苏省(?:全行|全市(?:农商行|银行|机构)?|13\s*个市(?:的)?(?:农商行|银行|机构)?)|"
+    r"13\s*家(?:农商行|银行|机构)?"
+)
 POPULATION_INTENT = re.compile(
     r"13家|哪家|哪些|多少家|有几家|前\d|后\d|前三|后三|最高|最低|最好|最差"
 )
@@ -81,7 +85,13 @@ class ContextRouter:
                 question,
             )
         )
-        population_intent = bool(POPULATION_INTENT.search(question))
+        population_intent = bool(
+            POPULATION_INTENT.search(question)
+            or (
+                ALL_ORGANIZATION_SCOPE.search(question)
+                and not re.search(r"全省(?:均值|平均)", question)
+            )
+        )
         dialogue_reference = bool(EXPLICIT_DIALOGUE_REFERENCE.search(question))
         list_followup = bool(ORGANIZATION_LIST_FOLLOWUP.fullmatch(question))
 

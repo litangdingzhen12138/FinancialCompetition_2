@@ -35,6 +35,22 @@ def test_business_relative_time_is_not_conversation_history(service):
     assert decision.history_limit == 0
 
 
+def test_province_wide_scope_does_not_inherit_a_previous_selected_organization(service):
+    state = SessionState(
+        last_organizations=("ORG010",),
+        last_metrics=("ZB013",),
+        last_date="2026-04-30",
+    )
+
+    decision = service.context_router.classify(
+        "江苏省全市农商行在2026年3月31日，各项存款余额总额是多少？",
+        state,
+    )
+
+    assert decision.dependency == "self_contained"
+    assert decision.history_limit == 0
+
+
 def test_redundant_history_phrase_does_not_force_context(service):
     state = SessionState(
         last_organizations=("ORG003",),

@@ -21,6 +21,8 @@ def _explicit_dates(question: str) -> list[tuple[int, int, str]]:
     found: list[tuple[int, int, str]] = []
     patterns = (
         (r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日|号)?", "day"),
+        (r"(?<!\d)(2\d)[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日|号)?", "short_day"),
+        (r"今年(\d{1,2})月(\d{1,2})(?:日|号)?", "current_day"),
         (r"(20\d{2})年(\d{1,2})月(?:底|末|月底|月末)", "month"),
         (r"(20\d{2})年(?:第)?([一二三四1234])季度(?:末)?", "quarter"),
         (r"(20\d{2})[- ]?Q([1-4])(?:末)?", "quarter"),
@@ -31,16 +33,25 @@ def _explicit_dates(question: str) -> list[tuple[int, int, str]]:
         for match in re.finditer(pattern, question, re.IGNORECASE):
             if any(match.start() < end and match.end() > start for start, end in occupied):
                 continue
-            year = int(match.group(1))
-            if kind == "day":
+            if kind == "current_day":
+                year = date.today().year
+                value = _iso(year, int(match.group(1)), int(match.group(2)))
+            elif kind == "short_day":
+                year = 2000 + int(match.group(1))
+                value = _iso(year, int(match.group(2)), int(match.group(3)))
+            elif kind == "day":
+                year = int(match.group(1))
                 value = _iso(year, int(match.group(2)), int(match.group(3)))
             elif kind == "month":
+                year = int(match.group(1))
                 month = int(match.group(2))
                 value = _iso(year, month, monthrange(year, month)[1])
             elif kind == "quarter":
+                year = int(match.group(1))
                 month = _QUARTERS[match.group(2)] * 3
                 value = _iso(year, month, monthrange(year, month)[1])
             else:
+                year = int(match.group(1))
                 value = f"{year}-12-31"
             occupied.append((match.start(), match.end()))
             found.append((match.start(), match.end(), value))

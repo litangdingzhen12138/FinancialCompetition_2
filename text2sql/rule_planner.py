@@ -11,7 +11,12 @@ from calendar import monthrange
 from dataclasses import dataclass, replace
 import re
 
-from .context_router import ContextRouter, ORGANIZATION_LIST_FOLLOWUP, PLURAL_REFERENCE
+from .context_router import (
+    ALL_ORGANIZATION_SCOPE,
+    ContextRouter,
+    ORGANIZATION_LIST_FOLLOWUP,
+    PLURAL_REFERENCE,
+)
 from .date_resolver import comparison_date, resolve_date, year_beginning
 from .models import PlanFilter, QueryPlan, SessionState
 from .semantic_catalog import (
@@ -385,7 +390,7 @@ class RulePlanner:
             )
         )
         all_scope = (asks_population and not bounded_candidate_scope) or (
-            bool(re.search(r"全省|13家", question))
+            bool(ALL_ORGANIZATION_SCOPE.search(question))
             and not organizations
             and not asks_selected_rank
         )

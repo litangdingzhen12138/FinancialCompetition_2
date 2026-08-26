@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import date
+
 import duckdb
 import pytest
 
 from text2sql.answerer import format_answer
 from text2sql.date_resolver import comparison_date, resolve_date
 from text2sql.models import QueryPlan, SessionState
+from text2sql.pending_query import should_start_pending
 from text2sql.sql_compiler import compile_rule_sql
 
 
@@ -309,6 +312,33 @@ def test_date_resolution_is_not_tied_to_the_benchmark_year():
     assert current == "2028-06-30"
     assert comparison == "2027-12-31"
     assert kind == "explicit_comparison"
+
+
+def test_current_year_and_short_year_dates_are_resolved():
+    assert resolve_date("今年2月1日") == f"{date.today().year}-02-01"
+    assert resolve_date("25年2月1日") == "2025-02-01"
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_date"),
+    [
+        ("江苏省全行今年2月1日各项贷款总额是多少", f"{date.today().year}-02-01"),
+        ("江苏省13个市农商行25年2月1日各项贷款总额是多少", "2025-02-01"),
+        ("江苏省全市农商行在2026年3月31日，各项存款余额总额是多少？", "2026-03-31"),
+    ],
+)
+def test_province_wide_scope_aliases_fall_through_without_false_missing_slots(
+    service,
+    question,
+    expected_date,
+):
+    decision = service.rule_planner.plan(question, SessionState(), use_context=False)
+
+    assert decision.plan is None
+    assert decision.candidates["organization_scope"] == "all"
+    assert decision.candidates["organizations"] == ()
+    assert decision.candidates["current_date"] == expected_date
+    assert should_start_pending(question, decision) is False
 
 
 def test_year_beginning_uses_fixed_workbook_baseline():
