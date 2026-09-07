@@ -35,6 +35,10 @@ test("restores authentication without server-rendering the login form", async ()
   assert.match(html, /正在进入工作空间/);
   assert.doesNotMatch(html, /登录数衡|请输入账号|请输入密码/);
   assert.match(html, /og\.png/);
+  assert.match(html, /陕ICP备2026022362号/);
+  assert.match(html, /href="https:\/\/beian\.miit\.gov\.cn\/"/);
+  assert.match(html, /target="_blank"/);
+  assert.match(html, /rel="noopener noreferrer"/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
 });
 
@@ -76,15 +80,24 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
   assert.doesNotMatch(historyPage, /AppShell/);
   assert.match(layout, /数衡 BankInsight/);
   assert.match(layout, /\/og\.png/);
+  assert.match(layout, /陕ICP备2026022362号/);
   assert.match(workbench, /conversation-sidebar/);
   assert.match(workbench, /新建对话/);
   assert.match(workbench, /今天/);
   assert.match(workbench, /getHistory/);
   assert.match(workbench, /getSessionHistory/);
   assert.match(workbench, /conversation-turn-list/);
+  assert.match(workbench, /conversation-turn-message question/);
+  assert.match(workbench, /conversation-turn-message answer/);
+  assert.match(workbench, /conversation-collapse-button/);
+  assert.match(workbench, /conversation-resize-handle/);
+  assert.match(workbench, /result-scroll-panel/);
+  assert.match(workbench, /report-panel-card/);
+  assert.match(workbench, /query-composer-panel/);
   assert.doesNotMatch(workbench, /hero-metrics|example-row/);
-  assert.match(workbench, /从一句业务问题，到一份/);
+  assert.doesNotMatch(workbench, /从一句业务问题，到一份/);
   assert.match(appShell, /handleLogout/);
+  assert.match(appShell, /从一句业务问题，到一份/);
   assert.match(appShell, /LoginView/);
   assert.match(appShell, /useState<AuthUser \| null>\(getRememberedAuthUser\)/);
   assert.match(api, /getRememberedAuthUser/);
@@ -112,6 +125,20 @@ test("keeps the workbench, conversation sidebar and product metadata", async () 
   assert.match(adminView, /getActiveFreezes/);
   assert.match(adminView, /unfreezeUser/);
   assert.match(adminView, /当前冻结账号/);
+  assert.match(adminView, /指标数据更新/);
+  assert.match(adminView, /查看现有指标清单/);
+  assert.match(adminView, /当前仅支持现有指标的数据更新/);
+  assert.match(adminView, /确认覆盖现有数据/);
+  assert.match(adminView, /历史结果不会自动更新/);
+  assert.match(adminView, /指标含义/);
+  assert.match(api, /previewMetricDataImport/);
+  assert.match(api, /publishMetricDataImport/);
+  assert.match(api, /window\.location\.hostname === "localhost"/);
+  assert.match(api, /window\.location\.hostname === "127\.0\.0\.1"/);
+  assert.doesNotMatch(
+    api,
+    /NEXT_PUBLIC_API_BASE_URL\s*\?\?\s*"http:\/\/127\.0\.0\.1:8000"/,
+  );
   assert.match(adminView, /item\.details\.question/);
   assert.doesNotMatch(adminView, /item\.details\.answer/);
   assert.match(api, /\/api\/v1\/admin\/freezes/);

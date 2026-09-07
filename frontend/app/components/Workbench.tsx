@@ -1,6 +1,12 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import {
+  FormEvent,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   checkCapabilities,
   clearSession,
@@ -142,6 +148,8 @@ export function Workbench() {
   const [historyLoading, setHistoryLoading] = useState(true);
   const [clearingKey, setClearingKey] = useState<string | null>(null);
   const [connected, setConnected] = useState<boolean | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState<number | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const resultRef = useRef<HTMLDivElement>(null);
   const activeKeyRef = useRef(activeKey);
   const activeQueryIdsRef = useRef<Record<string, string | null>>({});
@@ -209,6 +217,33 @@ export function Workbench() {
         conversation.key === key ? updater(conversation) : conversation,
       ),
     );
+  }
+
+  function handleSidebarResizeStart(
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth =
+      event.currentTarget.parentElement?.getBoundingClientRect().width ?? 280;
+
+    function handlePointerMove(moveEvent: PointerEvent) {
+      setSidebarWidth(
+        Math.min(480, Math.max(240, startWidth + moveEvent.clientX - startX)),
+      );
+    }
+
+    function handlePointerUp() {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+      document.body.classList.remove("resizing-conversation-sidebar");
+    }
+
+    document.body.classList.add("resizing-conversation-sidebar");
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
   }
 
   function patchConversation(key: string, patch: Partial<Conversation>) {
@@ -337,9 +372,9 @@ export function Workbench() {
           }));
           if (activeKeyRef.current === conversationKey) {
             requestAnimationFrame(() =>
-              resultRef.current?.scrollIntoView({
+              resultRef.current?.scrollTo({
+                top: 0,
                 behavior: "smooth",
-                block: "start",
               }),
             );
           }
@@ -472,6 +507,9 @@ export function Workbench() {
       stage: "complete",
       message: "已打开该轮历史结果",
     });
+    requestAnimationFrame(() =>
+      resultRef.current?.scrollTo({ top: 0, behavior: "smooth" }),
+    );
   }
 
   async function handleClearConversation(conversationKey: string) {
@@ -541,12 +579,29 @@ export function Workbench() {
 
   return (
     <div className="workbench-layout">
-      <aside className="conversation-sidebar" aria-label="会话列表">
+      <aside
+        className={
+          sidebarCollapsed
+            ? "conversation-sidebar collapsed"
+            : "conversation-sidebar"
+        }
+        aria-label="会话列表"
+        style={{ width: sidebarCollapsed ? 52 : (sidebarWidth ?? undefined) }}
+      >
         <div className="conversation-sidebar-head">
           <div>
             <strong>智能问数</strong>
             <small>会话上下文独立隔离</small>
           </div>
+          <button
+            type="button"
+            className="conversation-collapse-button"
+            aria-label={sidebarCollapsed ? "展开会话窗口" : "收起会话窗口"}
+            title={sidebarCollapsed ? "展开会话窗口" : "收起会话窗口"}
+            onClick={() => setSidebarCollapsed((current) => !current)}
+          >
+            {sidebarCollapsed ? "›" : "‹"}
+          </button>
         </div>
         <button
           type="button"
@@ -650,7 +705,7 @@ export function Workbench() {
                   {conversation.key === activeConversation.key &&
                     conversation.expanded &&
                     (conversation.turns ?? []).length > 0 && (
-                      <div className="conversation-turn-list" aria-label="该会话的历史问题">
+                      <div className="conversation-turn-list" aria-label="该会话的历史问答">
                         {(conversation.turns ?? []).map((turn, index) => (
                           <button
                             key={turn.query_id}
@@ -661,10 +716,23 @@ export function Workbench() {
                                 : ""
                             }
                             onClick={() => handleSelectTurn(conversation.key, turn)}
-                            title={turn.question}
                           >
-                            <span>{index + 1}</span>
-                            <span>{turn.question}</span>
+                            <span className="conversation-turn-index">{index + 1}</span>
+                            <span className="conversation-turn-copy">
+                              <span className="conversation-turn-message question">
+                                <strong>问</strong>
+                                <span>{turn.question}</span>
+                              </span>
+                              <span className="conversation-turn-message answer">
+                                <strong>答</strong>
+                                <span>
+                                  {turn.insight?.summary ||
+                                    (turn.answer_status === "failed"
+                                      ? "该轮回答生成失败"
+                                      : "该轮回答正在生成")}
+                                </span>
+                              </span>
+                            </span>
                           </button>
                         ))}
                       </div>
@@ -675,136 +743,154 @@ export function Workbench() {
           ))}
         </div>
         <p className="conversation-sidebar-foot">切换会话不会带入其他线程的记忆</p>
+        <div
+          className="conversation-resize-handle"
+          role="separator"
+          aria-label="拖动调整会话窗口宽度"
+          aria-orientation="vertical"
+          aria-valuemin={240}
+          aria-valuemax={480}
+          aria-valuenow={sidebarWidth ?? undefined}
+          tabIndex={0}
+          onPointerDown={handleSidebarResizeStart}
+          onKeyDown={(event) => {
+            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+            event.preventDefault();
+            const renderedWidth =
+              event.currentTarget.parentElement?.getBoundingClientRect().width ?? 280;
+            setSidebarWidth((current) =>
+              Math.min(
+                480,
+                Math.max(
+                  240,
+                  (current ?? renderedWidth) +
+                    (event.key === "ArrowRight" ? 16 : -16),
+                ),
+              ),
+            );
+          }}
+        />
       </aside>
 
       <main className="workbench-main">
-      <section className="hero">
-        <div className="hero-copy">
-          <div className="live-label">
-            <span className={connected ? "status-dot" : "status-dot muted"} />
-            {connected === null
-              ? "正在连接问数引擎"
-              : connected
-                ? "问数引擎在线"
-                : "问数引擎未连接"}
+        <div className="result-scroll-panel">
+          <div className="report-panel-card" ref={resultRef}>
+            <div className="report-panel-status">
+              <span className={connected ? "status-dot" : "status-dot muted"} />
+              {connected === null
+                ? "正在连接问数引擎"
+                : connected
+                  ? "问数引擎在线"
+                  : "问数引擎未连接"}
+            </div>
+
+            {stage !== "idle" && (
+              <section className="pipeline" aria-live="polite">
+                <div className="pipeline-head">
+                  <strong>{message}</strong>
+                  {stage !== "error" && <span>{Math.min(completedIndex, 4)}/4</span>}
+                </div>
+                <div className="pipeline-track">
+                  {stages.map((item, index) => (
+                    <div
+                      key={item.key}
+                      className={
+                        index < completedIndex
+                          ? "pipeline-step done"
+                          : index === completedIndex
+                            ? "pipeline-step active"
+                            : "pipeline-step"
+                      }
+                    >
+                      <span>{index < completedIndex ? "✓" : index + 1}</span>
+                      <small>{item.label}</small>
+                    </div>
+                  ))}
+                </div>
+                {error && <p className="error-message">{error}</p>}
+              </section>
+            )}
+
+            {result ? (
+              <QueryResult
+                key={result.query_id}
+                initialResult={result}
+                streamedInsight={insight}
+                streamedAnswer={answerText}
+                answerStatus={answerStatus}
+                answerError={answerError}
+                onRetryAnswer={() =>
+                  void generateFinalAnswer(result, activeConversation.key)
+                }
+                onResultChange={(next) => {
+                  activeQueryIdsRef.current[activeConversation.key] = next.query_id;
+                  updateConversation(activeConversation.key, (current) => ({
+                    ...current,
+                    result: next,
+                    insight: next.insight,
+                    answerText: next.insight?.summary ?? "",
+                    answerStatus: next.answer_status,
+                    answerError: "",
+                    latestQueryId: next.query_id,
+                    updatedAt: next.generated_at,
+                    turns: upsertTurn(current.turns, next),
+                    stage: "complete",
+                    message: "下钻查询已完成并留痕",
+                  }));
+                }}
+              />
+            ) : (
+              <section className="empty-state-grid">
+                <article>
+                  <span>01</span>
+                  <h3>用业务语言提问</h3>
+                  <p>无需记忆表名、字段和复杂口径，多轮追问会继承上下文。</p>
+                </article>
+                <article>
+                  <span>02</span>
+                  <h3>自动选择最佳图表</h3>
+                  <p>根据时间、分类、构成和结果规模，推荐折线、柱状或表格。</p>
+                </article>
+                <article>
+                  <span>03</span>
+                  <h3>结论与证据同时给出</h3>
+                  <p>区分数据事实与业务推断，所有操作都可回溯、可审计。</p>
+                </article>
+              </section>
+            )}
           </div>
-          <h1>
-            从一句业务问题，到一份<span>可信结论</span>
-          </h1>
-          <p>
-            自动完成语义理解、SQL 生成、安全执行、智能出图与业务解释，
-            让经营数据真正进入决策现场。
-          </p>
         </div>
-      </section>
 
-      <section className="ask-card">
-        <form onSubmit={handleSubmit}>
-          <label htmlFor="question">你想了解什么？</label>
-          <div className="question-box">
-            <textarea
-              id="question"
-              value={question}
-              onChange={(event) =>
-                patchConversation(activeConversation.key, {
-                  question: event.target.value,
-                })
-              }
-              placeholder="例如：本季度各项存款余额排名前三的是哪几家？"
-              rows={3}
-            />
-            <button
-              type="submit"
-              className="ask-button"
-              disabled={
-                !question.trim() ||
-                !connected ||
-                isConversationBusy(activeConversation)
-              }
-            >
-              <span>生成分析</span>
-              <small>Enter ↗</small>
-            </button>
-          </div>
-        </form>
-      </section>
-
-      {stage !== "idle" && (
-        <section className="pipeline" aria-live="polite">
-          <div className="pipeline-head">
-            <strong>{message}</strong>
-            {stage !== "error" && <span>{Math.min(completedIndex, 4)}/4</span>}
-          </div>
-          <div className="pipeline-track">
-            {stages.map((item, index) => (
-              <div
-                key={item.key}
-                className={
-                  index < completedIndex
-                    ? "pipeline-step done"
-                    : index === completedIndex
-                      ? "pipeline-step active"
-                      : "pipeline-step"
+        <section className="ask-card query-composer-panel">
+          <form onSubmit={handleSubmit}>
+            <label htmlFor="question">你想了解什么？</label>
+            <div className="question-box">
+              <textarea
+                id="question"
+                value={question}
+                onChange={(event) =>
+                  patchConversation(activeConversation.key, {
+                    question: event.target.value,
+                  })
+                }
+                placeholder="例如：本季度各项存款余额排名前三的是哪几家？"
+                rows={3}
+              />
+              <button
+                type="submit"
+                className="ask-button"
+                disabled={
+                  !question.trim() ||
+                  !connected ||
+                  isConversationBusy(activeConversation)
                 }
               >
-                <span>{index < completedIndex ? "✓" : index + 1}</span>
-                <small>{item.label}</small>
-              </div>
-            ))}
-          </div>
-          {error && <p className="error-message">{error}</p>}
+                <span>生成分析</span>
+                <small>Enter ↗</small>
+              </button>
+            </div>
+          </form>
         </section>
-      )}
-
-      <div ref={resultRef}>
-        {result ? (
-          <QueryResult
-            key={result.query_id}
-            initialResult={result}
-            streamedInsight={insight}
-            streamedAnswer={answerText}
-            answerStatus={answerStatus}
-            answerError={answerError}
-            onRetryAnswer={() =>
-              void generateFinalAnswer(result, activeConversation.key)
-            }
-            onResultChange={(next) => {
-              activeQueryIdsRef.current[activeConversation.key] = next.query_id;
-              updateConversation(activeConversation.key, (current) => ({
-                ...current,
-                result: next,
-                insight: next.insight,
-                answerText: next.insight?.summary ?? "",
-                answerStatus: next.answer_status,
-                answerError: "",
-                latestQueryId: next.query_id,
-                updatedAt: next.generated_at,
-                turns: upsertTurn(current.turns, next),
-                stage: "complete",
-                message: "下钻查询已完成并留痕",
-              }));
-            }}
-          />
-        ) : (
-          <section className="empty-state-grid">
-            <article>
-              <span>01</span>
-              <h3>用业务语言提问</h3>
-              <p>无需记忆表名、字段和复杂口径，多轮追问会继承上下文。</p>
-            </article>
-            <article>
-              <span>02</span>
-              <h3>自动选择最佳图表</h3>
-              <p>根据时间、分类、构成和结果规模，推荐折线、柱状或表格。</p>
-            </article>
-            <article>
-              <span>03</span>
-              <h3>结论与证据同时给出</h3>
-              <p>区分数据事实与业务推断，所有操作都可回溯、可审计。</p>
-            </article>
-          </section>
-        )}
-      </div>
       </main>
     </div>
   );

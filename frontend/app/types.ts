@@ -119,3 +119,31 @@ export type ActiveFreeze = {
   alert_id: string | null;
   updated_at: string;
 };
+
+export type MetricCatalogItem = {
+  metric_id: string;
+  metric_name: string;
+  description: string;
+  unit: string;
+};
+
+export type MetricDataImportPreview = {
+  file_name: string;
+  file_hash: string;
+  upload_mode: "complete_workbook" | "metric_data_only";
+  valid: boolean;
+  can_publish: boolean;
+  total_rows: number;
+  parsed_row_count: number;
+  insert_count: number;
+  unchanged_count: number;
+  overwrite_count: number;
+  duplicate_count: number;
+  conflicting_duplicate_count: number;
+  metric_ids: string[];
+  organization_count: number;
+  date_start: string | null;
+  date_end: string | null;
+  errors: string[];
+  published?: boolean;
+};

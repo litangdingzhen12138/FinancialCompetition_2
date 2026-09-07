@@ -6,12 +6,22 @@ import type {
   AdminUserSummary,
   HistoryItem,
   Insight,
+  MetricCatalogItem,
+  MetricDataImportPreview,
   QueryResponse,
   TimeGranularity,
 } from "../types";
 
+function defaultApiBase(): string {
+  if (typeof window === "undefined") return "";
+  return window.location.hostname === "localhost" ||
+    window.location.hostname === "127.0.0.1"
+    ? "http://127.0.0.1:8000"
+    : "";
+}
+
 export const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? defaultApiBase();
 
 const AUTH_TOKEN_KEY = "bankinsight.auth.token";
 const AUTH_USER_KEY = "bankinsight.auth.user";
@@ -541,4 +551,52 @@ export async function unfreezeUser(userId: string): Promise<void> {
     { method: "DELETE", headers: authHeaders() },
   );
   if (!response.ok) throw new Error(await errorMessage(response));
+}
+
+export async function getAdminMetrics(): Promise<MetricCatalogItem[]> {
+  const response = await fetch(`${API_BASE}/api/v1/admin/metrics`, {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  const payload = (await response.json()) as { items: MetricCatalogItem[] };
+  return payload.items;
+}
+
+async function sendMetricDataFile(
+  path: "preview" | "publish",
+  file: File,
+  confirmOverwrite = false,
+): Promise<MetricDataImportPreview> {
+  const parameters = new URLSearchParams({ filename: file.name });
+  if (path === "publish" && confirmOverwrite) {
+    parameters.set("confirm_overwrite", "true");
+  }
+  const response = await fetch(
+    `${API_BASE}/api/v1/admin/data-imports/${path}?${parameters}`,
+    {
+      method: "POST",
+      headers: {
+        ...authHeaders(),
+        "Content-Type":
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      },
+      body: file,
+    },
+  );
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json() as Promise<MetricDataImportPreview>;
+}
+
+export function previewMetricDataImport(
+  file: File,
+): Promise<MetricDataImportPreview> {
+  return sendMetricDataFile("preview", file);
+}
+
+export function publishMetricDataImport(
+  file: File,
+  confirmOverwrite: boolean,
+): Promise<MetricDataImportPreview> {
+  return sendMetricDataFile("publish", file, confirmOverwrite);
 }

@@ -1,18 +1,21 @@
-{$PUBLIC_HOST} {
-    encode zstd gzip
+{$PUBLIC_HOST::80} {
+	# Empty by default. compose.tls.yaml expands this to a custom tls directive.
+	{$CADDY_TLS_CONFIG:}
 
-    header {
-        X-Content-Type-Options nosniff
-        X-Frame-Options DENY
-        Referrer-Policy strict-origin-when-cross-origin
-    }
+	encode zstd gzip
 
-    @backend path /api/* /health
-    handle @backend {
-        reverse_proxy backend:8000
-    }
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
 
-    handle {
-        reverse_proxy frontend:3000
-    }
+	@backend path /api/* /health /docs /docs/* /redoc /openapi.json
+	handle @backend {
+		reverse_proxy backend:8000
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
 }

@@ -1,17 +1,19 @@
 FROM python:3.12-slim-bookworm
 
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    TEXT2SQL_XLSX_PATH=/app/source/dataset.xlsx \
+    TEXT2SQL_DB_PATH=/app/data/bank_metrics.duckdb \
+    TEXT2SQL_PRODUCT_DB_PATH=/app/data/product.sqlite3
 
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN python -m pip install \
-    --index-url https://mirrors.tencent.com/pypi/simple \
-    --trusted-host mirrors.tencent.com \
-    -r requirements.txt
+RUN python -m pip install --index-url "${PYPI_INDEX_URL}" -r requirements.txt
 
 COPY text2sql ./text2sql
 COPY ["比赛数据/22-多模态技术与数据治理赛道-江苏农商联合银行-基于大模型与NL2SQL的银行业智能问数系统构建与应用/基于大模型与NL2SQL的银行业智能问数系统构建与应用_数据集.xlsx", "/app/source/dataset.xlsx"]

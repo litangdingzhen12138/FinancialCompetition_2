@@ -1,9 +1,11 @@
 FROM node:22-bookworm-slim AS build
 
+ARG NPM_REGISTRY=https://registry.npmjs.org
+
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm config set registry https://mirrors.tencent.com/npm/ && npm ci
+RUN npm ci --registry="${NPM_REGISTRY}"
 
 COPY . .
 

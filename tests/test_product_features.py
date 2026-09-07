@@ -63,6 +63,31 @@ def test_difference_result_card_uses_change_value(service) -> None:
     assert alternatives[0].chart_type == "table"
 
 
+def test_ratio_columns_use_metric_catalog_names(service, tmp_path) -> None:
+    product = ProductQueryService(service, ProductStore(tmp_path / "product.sqlite3"))
+    plan = QueryPlan(
+        source="rule",
+        query_type="derived_metric",
+        operation="ratio",
+        organizations=("ORG010",),
+        organization_scope="selected",
+        metrics=("ZB002", "ZB001"),
+        current_date="2026-03-31",
+        derived_formula="deposit_loan_ratio",
+    )
+    result = QueryResult(
+        ("org_id", "org_name", "numerator", "denominator", "derived_value"),
+        (("ORG010", "江苏省J市农商行", 47.5, 57.78, 82.2084),),
+    )
+
+    columns = product._columns(result, plan.to_dict())
+    record = {"columns": list(result.columns), "plan": plan.to_dict()}
+
+    expected = ("机构编码", "机构名称", "各项贷款余额", "各项存款余额", "存贷比")
+    assert tuple(column.label for column in columns) == expected
+    assert product.export_headers(record) == expected
+
+
 def test_product_query_persists_history_and_permissions(service, tmp_path) -> None:
     settings = replace(service.settings, product_db_path=tmp_path / "product.sqlite3")
     service.settings = settings

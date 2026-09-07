@@ -183,6 +183,9 @@ GET /api/v1/queries/{query_id}/answer/stream
 | GET | `/api/v1/admin/alerts` | 安全告警列表 |
 | PATCH | `/api/v1/admin/alerts/{alert_id}` | 确认或关闭告警 |
 | GET | `/api/v1/admin/users` | 审计用户列表 |
+| GET | `/api/v1/admin/metrics` | 当前完整指标清单 |
+| POST | `/api/v1/admin/data-imports/preview?filename=...` | 校验并预览指标数据更新，正文为原始 `.xlsx` 字节 |
+| POST | `/api/v1/admin/data-imports/publish?filename=...` | 发布指标数据更新；覆盖时增加 `confirm_overwrite=true` |
 
 旧 `/query` 和 `/sessions/{session_id}` 固定返回410，避免形成匿名、无权限范围和无审计的旁路；本地批量回归请直接调用 Python/CLI 入口。
 
@@ -206,7 +209,7 @@ JSON 接口错误保持原有 `detail` 字段，同时增加机器可读错误�
 | 401 | `AUTH_UNAUTHORIZED` | 未登录或令牌失效 |
 | 403 | `AUTH_FORBIDDEN` | 权限不足 |
 | 404 | `RESOURCE_NOT_FOUND` | 资源不存在 |
-| 409 | `CONFIRMATION_REQUIRED` | 大批量导出需要二次确认 |
+| 409 | `CONFIRMATION_REQUIRED` | 大批量导出或指标数据覆盖需要二次确认 |
 | 410 | `LEGACY_ENDPOINT_DISABLED` | 旧版旁路接口已关闭 |
 | 422 | `REQUEST_VALIDATION_ERROR` | 请求字段校验失败 |
 | 423 | `ACCOUNT_FROZEN` | 异常访问触发临时冻结 |

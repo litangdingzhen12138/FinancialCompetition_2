@@ -1,0 +1,9 @@
+services:
+  caddy:
+    environment:
+      CADDY_TLS_CONFIG: tls ${TLS_CERT_FILE:-/certs/tls.crt} ${TLS_KEY_FILE:-/certs/tls.key}
+    volumes:
+      - type: bind
+        source: ${TLS_CERT_DIR:?TLS_CERT_DIR is required for custom TLS}
+        target: /certs
+        read_only: true

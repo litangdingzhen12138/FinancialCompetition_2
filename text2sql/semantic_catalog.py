@@ -179,15 +179,9 @@ class SemanticCatalog:
                 "全省均值要求包含"
                 f"{PROVINCE_ORGANIZATION_COUNT}家机构，当前机构表为{len(self.organizations)}家"
             )
-        if self.metric_population_bounds != (
-            PROVINCE_ORGANIZATION_COUNT,
-            PROVINCE_ORGANIZATION_COUNT,
-        ):
-            raise DataBuildError(
-                "全省均值要求每个日期和指标均包含"
-                f"{PROVINCE_ORGANIZATION_COUNT}家机构，当前最小/最大覆盖数为"
-                f"{self.metric_population_bounds}"
-            )
+        # Incremental uploads may introduce a date before every organization has
+        # reported. Province-average queries still enforce all 13 organizations
+        # at execution time; partial dates must not make the whole service fail.
 
     def resolve_organizations(self, question: str) -> tuple[str, ...]:
         found: list[tuple[int, str]] = []

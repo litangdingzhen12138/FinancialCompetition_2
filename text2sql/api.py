@@ -22,6 +22,7 @@ from openpyxl import Workbook
 from pydantic import BaseModel, Field
 
 from .errors import Text2SQLError
+from .metric_data_import import OverwriteConfirmationRequired
 from .product_auth import ProductAuthService
 from .product_models import (
     BusinessRole,
@@ -75,6 +76,7 @@ app.add_middleware(
 
 
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+MAX_DATA_IMPORT_BYTES = 25 * 1024 * 1024
 ERROR_CODE_BY_STATUS = {
     400: "REQUEST_INVALID",
     401: "AUTH_UNAUTHORIZED",
@@ -357,6 +359,15 @@ def _product_error(exc: Exception) -> HTTPException:
                 "message": str(exc),
                 "row_count": exc.row_count,
                 "confirm_parameter": "confirm_large_export=true",
+            },
+        )
+    if isinstance(exc, OverwriteConfirmationRequired):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "preview": exc.preview,
+                "confirm_parameter": "confirm_overwrite=true",
             },
         )
     if isinstance(exc, PermissionError):
@@ -737,8 +748,9 @@ def batch_export_history(
     authorization: str | None = Header(default=None),
 ) -> Response:
     user = user_context(x_user_id, x_user_role, x_org_scope, authorization)
+    service = get_product_service()
     try:
-        records = get_product_service().batch_export_records(
+        records = service.batch_export_records(
             user,
             scope=scope,
             recent_count=recent_count,
@@ -803,7 +815,7 @@ def batch_export_history(
                 record["question"],
                 record.get("sql") or "",
                 json.dumps(record["plan"], ensure_ascii=False, default=str),
-                json.dumps(record["columns"], ensure_ascii=False, default=str),
+                json.dumps(service.export_headers(record), ensure_ascii=False),
                 json.dumps(record["rows"], ensure_ascii=False, default=str),
                 json.dumps(record["visualization"], ensure_ascii=False, default=str),
                 json.dumps(record["insight"], ensure_ascii=False, default=str),
@@ -839,8 +851,9 @@ def export_query(
     authorization: str | None = Header(default=None),
 ) -> Response:
     user = user_context(x_user_id, x_user_role, x_org_scope, authorization)
+    service = get_product_service()
     try:
-        record = get_product_service().export_record(
+        record = service.export_record(
             query_id,
             user,
             confirm_large_export=confirm_large_export,
@@ -848,10 +861,11 @@ def export_query(
     except Exception as exc:
         raise _product_error(exc) from exc
     filename = f"bank-query-{query_id[:8]}"
+    export_headers = service.export_headers(record)
     if format == "csv":
         stream = StringIO()
         writer = csv.writer(stream)
-        writer.writerow(record["columns"])
+        writer.writerow(export_headers)
         writer.writerows(record["rows"])
         return Response(
             content="\ufeff" + stream.getvalue(),
@@ -865,7 +879,7 @@ def export_query(
     sheet.append(["结论", record["answer"]])
     sheet.append(["生成时间", record["created_at"]])
     sheet.append([])
-    sheet.append(record["columns"])
+    sheet.append(export_headers)
     for row in record["rows"]:
         sheet.append(row)
     output = BytesIO()
@@ -937,6 +951,85 @@ def admin_overview(
     user = user_context(x_user_id, x_user_role, "", authorization)
     try:
         return get_product_service().admin_overview(user)
+    except Exception as exc:
+        raise _product_error(exc) from exc
+
+
+@app.get(
+    "/api/v1/admin/metrics",
+    tags=["管理"],
+    summary="查询当前完整指标清单",
+    responses=ERROR_RESPONSES,
+)
+def admin_metrics(
+    x_user_id: str = Header(default="demo-admin", max_length=128),
+    x_user_role: str = Header(default="admin"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    user = user_context(x_user_id, x_user_role, "", authorization)
+    try:
+        items = get_product_service().admin_metrics(user)
+        return {"items": items, "total": len(items)}
+    except Exception as exc:
+        raise _product_error(exc) from exc
+
+
+async def _data_import_body(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_DATA_IMPORT_BYTES:
+        raise ValueError("上传文件不能超过25MB")
+    content = await request.body()
+    if not content:
+        raise ValueError("上传文件为空")
+    if len(content) > MAX_DATA_IMPORT_BYTES:
+        raise ValueError("上传文件不能超过25MB")
+    return content
+
+
+@app.post(
+    "/api/v1/admin/data-imports/preview",
+    tags=["管理"],
+    summary="校验并预览指标数据更新",
+    responses=ERROR_RESPONSES,
+)
+async def preview_admin_data_import(
+    request: Request,
+    filename: str = Query(min_length=1, max_length=255),
+    x_user_id: str = Header(default="demo-admin", max_length=128),
+    x_user_role: str = Header(default="admin"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user = user_context(x_user_id, x_user_role, "", authorization)
+    try:
+        content = await _data_import_body(request)
+        return get_product_service().preview_metric_data_import(content, filename, user)
+    except Exception as exc:
+        raise _product_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/admin/data-imports/publish",
+    tags=["管理"],
+    summary="发布指标数据增量更新",
+    responses=ERROR_RESPONSES,
+)
+async def publish_admin_data_import(
+    request: Request,
+    filename: str = Query(min_length=1, max_length=255),
+    confirm_overwrite: bool = Query(default=False),
+    x_user_id: str = Header(default="demo-admin", max_length=128),
+    x_user_role: str = Header(default="admin"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user = user_context(x_user_id, x_user_role, "", authorization)
+    try:
+        content = await _data_import_body(request)
+        return get_product_service().publish_metric_data_import(
+            content,
+            filename,
+            user,
+            confirm_overwrite=confirm_overwrite,
+        )
     except Exception as exc:
         raise _product_error(exc) from exc
 

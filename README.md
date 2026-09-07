@@ -55,6 +55,82 @@ ORG013 为M市。`analyst2` 和 `analyst3` 当前默认都只允许访问A市农
 - LLM使用OpenAI兼容接口，仅在规则未覆盖或失败时调用；
 - 提供Python入口、CLI和FastAPI接口。
 
+## Docker 一键部署（Windows / Linux / macOS）
+
+只需安装 Docker Desktop，或在 Linux 安装 Docker Engine 与 Docker Compose
+插件。首次构建需要联网下载基础镜像和依赖；建议至少预留 4 GB 内存与 5 GB
+磁盘空间。
+
+在项目根目录执行同一条命令即可构建并后台启动前端、后端和 Caddy：
+
+```bash
+docker compose up --build -d
+```
+
+启动完成后访问：
+
+- 工作台：<http://localhost>
+- 健康检查：<http://localhost/health>
+- API 文档：<http://localhost/docs>
+
+首次启动时后端会根据内置 Excel 数据集自动生成数据库，通常比后续启动耗时更长。
+可使用以下命令检查状态和日志：
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+更新代码后的重新部署仍使用同一条启动命令。停止服务和重新启动分别为：
+
+```bash
+docker compose down
+docker compose up -d
+```
+
+数据库保存在项目根目录的 `deploy-data/`，执行 `docker compose down` 不会删除。
+不要在服务运行期间直接修改其中的数据库文件。
+
+### 生产环境配置
+
+联网或生产部署前，复制 `.env.production.example` 为 `.env.production`，至少修改
+域名、LLM API Key 和所有账号密码。Windows PowerShell 使用：
+
+```powershell
+Copy-Item .env.production.example .env.production
+docker compose --env-file .env.production up --build -d
+```
+
+Linux/macOS 使用：
+
+```bash
+cp .env.production.example .env.production
+docker compose --env-file .env.production up --build -d
+```
+
+将 `PUBLIC_HOST` 同时填写为已解析到服务器公网 IP 的主域名和 www 域名，例如
+`example.com, www.example.com`。两个域名均应配置 DNS 解析；当外部可访问 80、443
+端口时，Caddy 会为它们自动申请、续期 HTTPS 证书。`PUBLIC_BASE_URL` 保持为空
+即可，浏览器会通过当前域名同源访问后端。
+
+如必须加载已有证书，把证书和私钥放入同一目录，在 `.env.production` 中设置
+`TLS_CERT_DIR`、`TLS_CERT_FILE`、`TLS_KEY_FILE`，然后使用可选覆盖文件启动：
+
+```bash
+docker compose -f compose.yaml -f compose.tls.yaml --env-file .env.production up --build -d
+```
+
+自有证书模式下，`TLS_CERT_DIR` 是宿主机目录（Windows 路径建议写成
+`D:/path/to/certs`），另外两个路径是容器内 `/certs/` 下的证书文件路径。
+如 80 或 443 端口已占用，可通过 `HTTP_PORT`、`HTTPS_PORT` 修改宿主机映射端口；
+使用自动 HTTPS 时，公网入口仍应能到达标准 80、443 端口。
+
+默认零配置部署可以运行规则问数；涉及规则未覆盖场景时，需要在
+`.env.production` 中提供有效的 LLM 配置。生产环境务必保持
+`TEXT2SQL_ALLOW_HEADER_AUTH=false`。完整的环境变量模板见
+`.env.production.example`。如果所在网络不能访问默认 PyPI 或 NPM，可通过
+`PYPI_INDEX_URL`、`NPM_REGISTRY` 指定可用镜像源，无需修改 Dockerfile。
+
 ## 安装
 
 ```powershell
@@ -90,6 +166,16 @@ TEXT2SQL_DB_PATH=D:\path\bank_metrics.duckdb
 python -m text2sql.cli "把江苏省E市农商行2025年10月31日的不良率、拨备覆盖率、逾期率和资本充足率都列出来，并告诉我各自在全省排第几"
 python -m text2sql.cli "2026年3月末，哪家农商行的不良贷款率最低？" --json
 ```
+
+## 管理员增量更新指标数据
+
+管理工作台支持上传 `.xlsx` 文件更新当前21项指标。文件可以是完整数据集，
+也可以只包含 `指标数据表`；上传指标允许少于当前指标清单，但不能新增指标。
+系统先校验文件并统计新增、无变化、待覆盖和文件内重复数据，存在待覆盖记录时
+必须二次确认，发布过程使用事务保证整批成功或整批回滚。
+
+增量发布直接写入当前 DuckDB。再次执行 `--build-db` 会按配置的源 Excel 全量
+重建数据库，因此在源文件未同步更新前不要使用该命令覆盖已发布的增量数据。
 
 ## Python与多轮对话
 

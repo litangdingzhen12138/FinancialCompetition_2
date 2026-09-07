@@ -4,9 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import {
   getActiveFreezes,
   getAdminOverview,
+  getAdminMetrics,
   getAdminUsers,
   getAudit,
   getSecurityAlerts,
+  previewMetricDataImport,
+  publishMetricDataImport,
   resolveSecurityAlert,
   unfreezeUser,
   type AdminOverview,
@@ -15,6 +18,8 @@ import type {
   ActiveFreeze,
   AdminUserSummary,
   AuditItem,
+  MetricCatalogItem,
+  MetricDataImportPreview,
   SecurityAlert,
 } from "../types";
 
@@ -34,6 +39,8 @@ const actionLabels: Record<string, string> = {
   "history.batch_exported": "批量导出历史",
   "share.viewed": "查看分享",
   "user.unfrozen": "管理员解冻",
+  "data_import.previewed": "校验数据文件",
+  "data_import.published": "发布数据更新",
   session_clear: "清除会话",
 };
 
@@ -76,6 +83,15 @@ export function AdminView() {
   const [auditLoading, setAuditLoading] = useState(true);
   const [error, setError] = useState("");
   const auditRef = useRef<HTMLElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [importPreview, setImportPreview] = useState<MetricDataImportPreview | null>(null);
+  const [importBusy, setImportBusy] = useState<"preview" | "publish" | "">("");
+  const [importMessage, setImportMessage] = useState("");
+  const [metricCatalog, setMetricCatalog] = useState<MetricCatalogItem[]>([]);
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [overwriteConfirmOpen, setOverwriteConfirmOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -287,6 +303,64 @@ export function AdminView() {
     }
   }
 
+  async function openMetricCatalog() {
+    setCatalogOpen(true);
+    if (metricCatalog.length || catalogLoading) return;
+    setCatalogLoading(true);
+    try {
+      setMetricCatalog(await getAdminMetrics());
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "指标清单加载失败");
+      setCatalogOpen(false);
+    } finally {
+      setCatalogLoading(false);
+    }
+  }
+
+  function chooseImportFile(file: File | null) {
+    setSelectedFile(file);
+    setImportPreview(null);
+    setImportMessage("");
+    setOverwriteConfirmOpen(false);
+    if (!file && fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  async function previewImport() {
+    if (!selectedFile || importBusy) return;
+    setImportBusy("preview");
+    setImportMessage("");
+    try {
+      const preview = await previewMetricDataImport(selectedFile);
+      setImportPreview(preview);
+      setImportMessage(preview.valid ? "文件校验通过，请核对更新统计。" : "文件校验未通过。");
+    } catch (caught) {
+      setImportPreview(null);
+      setImportMessage(caught instanceof Error ? caught.message : "文件校验失败");
+    } finally {
+      setImportBusy("");
+    }
+  }
+
+  async function publishImport(confirmOverwrite: boolean) {
+    if (!selectedFile || importBusy) return;
+    setImportBusy("publish");
+    setOverwriteConfirmOpen(false);
+    setImportMessage("");
+    try {
+      const result = await publishMetricDataImport(selectedFile, confirmOverwrite);
+      setImportMessage(
+        `发布完成：新增 ${result.insert_count} 条，覆盖 ${result.overwrite_count} 条。`,
+      );
+      setImportPreview(null);
+      setSelectedFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    } catch (caught) {
+      setImportMessage(caught instanceof Error ? caught.message : "数据发布失败");
+    } finally {
+      setImportBusy("");
+    }
+  }
+
   return (
     <section>
       <div className="page-toolbar admin-toolbar">
@@ -306,6 +380,96 @@ export function AdminView() {
       </div>
 
       {error && <p className="error-message page-error">{error}</p>}
+
+      <section className="data-import-card" aria-label="指标数据更新">
+        <div className="data-import-head">
+          <div>
+            <p className="section-kicker">DATA UPDATE</p>
+            <h2>指标数据更新</h2>
+            <p>
+              上传完整 Excel，或只包含“指标数据表”的 Excel，校验后增量合并。
+            </p>
+          </div>
+          <button type="button" className="metric-catalog-button" onClick={openMetricCatalog}>
+            查看现有指标清单
+          </button>
+        </div>
+
+        <div className="data-import-tip">
+          当前仅支持现有指标的数据更新，指标清单发生变化的文件暂不支持直接发布，请自行扩展指标清单之后再次发布。
+        </div>
+
+        <div className="data-import-controls">
+          <label className="data-file-picker">
+            <span>选择 Excel 文件</span>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              onChange={(event) => chooseImportFile(event.target.files?.[0] ?? null)}
+            />
+          </label>
+          <span className="selected-file-name">
+            {selectedFile ? `${selectedFile.name} · ${(selectedFile.size / 1024 / 1024).toFixed(2)} MB` : "尚未选择文件"}
+          </span>
+          <button
+            type="button"
+            className="data-import-primary"
+            disabled={!selectedFile || Boolean(importBusy)}
+            onClick={previewImport}
+          >
+            {importBusy === "preview" ? "校验中…" : "校验文件"}
+          </button>
+        </div>
+
+        {importMessage && (
+          <p className={importPreview?.valid === false ? "data-import-message invalid" : "data-import-message"}>
+            {importMessage}
+          </p>
+        )}
+
+        {importPreview && (
+          <div className="data-import-preview">
+            <div className="import-stat-grid">
+              <div><span>新增</span><strong>{importPreview.insert_count}</strong></div>
+              <div><span>无变化</span><strong>{importPreview.unchanged_count}</strong></div>
+              <div><span>待覆盖</span><strong>{importPreview.overwrite_count}</strong></div>
+              <div><span>文件内去重</span><strong>{importPreview.duplicate_count}</strong></div>
+            </div>
+            <p>
+              涉及 {importPreview.metric_ids.length} 项指标、{importPreview.organization_count} 家机构
+              {importPreview.date_start && importPreview.date_end
+                ? `，日期范围 ${importPreview.date_start} 至 ${importPreview.date_end}`
+                : ""}
+            </p>
+            {importPreview.errors.length > 0 && (
+              <ul className="data-import-errors">
+                {importPreview.errors.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}
+              </ul>
+            )}
+            {importPreview.can_publish && (
+              <div className="data-import-actions">
+                <button type="button" onClick={() => chooseImportFile(null)}>取消</button>
+                <button
+                  type="button"
+                  className={importPreview.overwrite_count ? "danger" : "primary"}
+                  disabled={Boolean(importBusy)}
+                  onClick={() => {
+                    if (importPreview.overwrite_count) setOverwriteConfirmOpen(true);
+                    else void publishImport(false);
+                  }}
+                >
+                  {importBusy === "publish"
+                    ? "发布中…"
+                    : importPreview.overwrite_count
+                      ? "确认覆盖并发布"
+                      : "发布更新"}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
 
       <div className="overview-grid">
         {cards.map((card, index) => {
@@ -554,6 +718,58 @@ export function AdminView() {
           </div>
         </section>
       </div>
+
+      {catalogOpen && (
+        <div className="admin-modal-backdrop" role="presentation">
+          <section className="admin-modal metric-catalog-modal" role="dialog" aria-modal="true" aria-labelledby="metric-catalog-title">
+            <div className="admin-modal-head">
+              <div>
+                <p className="section-kicker">METRIC CATALOG</p>
+                <h2 id="metric-catalog-title">现有指标清单</h2>
+              </div>
+              <button type="button" aria-label="关闭指标清单" onClick={() => setCatalogOpen(false)}>×</button>
+            </div>
+            <p className="metric-catalog-count">共 {metricCatalog.length} 项指标</p>
+            <div className="metric-catalog-table">
+              <table>
+                <thead><tr><th>指标编号</th><th>指标名称</th><th>指标含义</th><th>指标单位</th></tr></thead>
+                <tbody>
+                  {catalogLoading && <tr><td colSpan={4}>指标清单加载中…</td></tr>}
+                  {metricCatalog.map((item) => (
+                    <tr key={item.metric_id}>
+                      <td>{item.metric_id}</td>
+                      <td>{item.metric_name}</td>
+                      <td>{item.description}</td>
+                      <td>{item.unit}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {overwriteConfirmOpen && importPreview && (
+        <div className="admin-modal-backdrop" role="presentation">
+          <section className="admin-modal overwrite-confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="overwrite-confirm-title">
+            <div className="admin-modal-head">
+              <h2 id="overwrite-confirm-title">确认覆盖现有数据？</h2>
+              <button type="button" aria-label="关闭覆盖确认" onClick={() => setOverwriteConfirmOpen(false)}>×</button>
+            </div>
+            <p>
+              将新增 {importPreview.insert_count} 条、覆盖 {importPreview.overwrite_count} 条、忽略 {importPreview.unchanged_count} 条无变化数据。
+            </p>
+            <p>覆盖后，后续查询、排名和图表将使用新值，历史结果不会自动更新。</p>
+            <div className="admin-modal-actions">
+              <button type="button" onClick={() => setOverwriteConfirmOpen(false)}>取消</button>
+              <button type="button" className="danger" disabled={Boolean(importBusy)} onClick={() => void publishImport(true)}>
+                确认覆盖 {importPreview.overwrite_count} 条并发布
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </section>
   );
 }

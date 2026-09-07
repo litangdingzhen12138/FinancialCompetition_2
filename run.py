@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from text2sql.models import QueryResponse
 from text2sql.service import Text2SQLService
 
 
@@ -14,6 +15,11 @@ def _service() -> Text2SQLService:
 
 def run(question: str, session_id: str = "default") -> str:
     return _service().ask(question, session_id).answer
+
+
+def run_with_metadata(question: str, session_id: str = "default") -> QueryResponse:
+    """Return the full response so callers can inspect answer_mode, route, sql, etc."""
+    return _service().ask(question, session_id)
 
 
 if __name__ == "__main__":

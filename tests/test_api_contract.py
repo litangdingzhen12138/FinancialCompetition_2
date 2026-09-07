@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from io import BytesIO
+
 from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 
 from text2sql import api
 from text2sql.datasource import DataSourceAdapter, DuckDBDataSourceAdapter
@@ -127,3 +130,84 @@ def test_openapi_exposes_query_contract_and_bearer_scheme() -> None:
 def test_default_service_uses_declared_data_source_boundary(service) -> None:
     assert isinstance(service.data_source, DuckDBDataSourceAdapter)
     assert isinstance(service.data_source, DataSourceAdapter)
+
+
+def test_query_xlsx_export_uses_chinese_headers(monkeypatch) -> None:
+    class StubProductService:
+        def export_record(self, query_id, user, *, confirm_large_export):
+            assert query_id == "query-ratio"
+            assert user.can_export
+            assert confirm_large_export is False
+            return {
+                "question": "查询存贷比",
+                "answer": "存贷比为82.21%",
+                "created_at": "2026-08-27T10:00:00+08:00",
+                "columns": ["org_name", "numerator", "denominator", "derived_value"],
+                "rows": [["江苏省J市农商行", 47.5, 57.78, 82.2084]],
+                "plan": {},
+            }
+
+        def export_headers(self, record):
+            assert record["columns"][1] == "numerator"
+            return ("机构名称", "各项贷款余额", "各项存款余额", "存贷比")
+
+    monkeypatch.setattr(api, "get_product_service", lambda: StubProductService())
+    response = TestClient(api.app).get("/api/v1/queries/query-ratio/export")
+
+    assert response.status_code == 200
+    workbook = load_workbook(BytesIO(response.content), read_only=True)
+    assert tuple(workbook["查询结果"].iter_rows(min_row=5, max_row=5, values_only=True))[0] == (
+        "机构名称",
+        "各项贷款余额",
+        "各项存款余额",
+        "存贷比",
+    )
+
+
+def test_admin_metric_import_contract_uses_raw_xlsx_body(monkeypatch) -> None:
+    class StubProductService:
+        def admin_metrics(self, user):
+            assert user.can_view_admin
+            return [
+                {
+                    "metric_id": "ZB001",
+                    "metric_name": "各项存款余额",
+                    "description": "各项存款余额",
+                    "unit": "亿元",
+                }
+            ]
+
+        def preview_metric_data_import(self, content, filename, user):
+            assert user.can_view_admin
+            assert content == b"xlsx-content"
+            assert filename == "increment.xlsx"
+            return {"valid": True, "insert_count": 1, "overwrite_count": 0}
+
+        def publish_metric_data_import(
+            self, content, filename, user, *, confirm_overwrite
+        ):
+            assert user.can_view_admin
+            assert content == b"xlsx-content"
+            assert filename == "increment.xlsx"
+            assert confirm_overwrite is True
+            return {"published": True, "insert_count": 1, "overwrite_count": 0}
+
+    monkeypatch.setattr(api, "get_product_service", lambda: StubProductService())
+    client = TestClient(api.app)
+
+    metrics = client.get("/api/v1/admin/metrics")
+    preview = client.post(
+        "/api/v1/admin/data-imports/preview?filename=increment.xlsx",
+        content=b"xlsx-content",
+    )
+    publish = client.post(
+        "/api/v1/admin/data-imports/publish?filename=increment.xlsx&confirm_overwrite=true",
+        content=b"xlsx-content",
+    )
+
+    assert metrics.status_code == 200
+    assert metrics.json()["total"] == 1
+    assert preview.status_code == 200
+    assert preview.json()["valid"] is True
+    assert publish.status_code == 200
+    assert publish.json()["published"] is True

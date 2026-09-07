@@ -12,6 +12,7 @@ from threading import Lock
 
 from .chart_recommender import ChartRecommender
 from .final_answer import FinalAnswerGenerator
+from .metric_data_import import MetricDataImporter
 from .models import DataAccessScope, PendingQuery, QueryResult
 from .product_models import (
     ChartSpec,
@@ -22,6 +23,7 @@ from .product_models import (
     UserContext,
 )
 from .product_store import ProductStore
+from .semantic_catalog import DERIVED_METRICS
 from .service import Text2SQLService
 
 
@@ -76,8 +78,61 @@ COLUMN_LABELS = {
     "comparison_value": "比较期值",
     "change_value": "变化值",
     "growth_rate": "增幅",
+    "derived_value": "计算值",
+    "result_value": "结果值",
+    "numerator": "分子",
+    "denominator": "分母",
+    "denominator_value": "分母值",
+    "component_value": "分项值",
+    "component_sum": "分项合计",
+    "average_value": "平均值",
+    "avg_value": "平均值",
+    "avg_val": "平均值",
+    "org_value": "本机构值",
+    "self_value": "本机构值",
     "metric_rank": "排名",
+    "result_rank": "结果排名",
+    "selection_rank": "入选排名",
+    "previous_rank": "原排名",
+    "current_rank": "当前排名",
+    "rank_change": "排名变化",
+    "rank_type": "排名分组",
     "province_average": "全省均值",
+    "province_avg": "全省均值",
+    "difference_from_average": "与全省均值之差",
+    "difference_value": "差额",
+    "difference": "差值",
+    "sum_value": "合计",
+    "total_value": "合计",
+    "corporate_value": "对公值",
+    "personal_value": "个人值",
+    "calculated_rate": "计算比率",
+    "npl_rate": "不良贷款率",
+    "npl_balance": "不良贷款余额",
+    "loan_balance": "各项贷款余额",
+    "is_equal": "是否相等",
+    "count": "数量",
+    "organization_count": "机构数",
+    "matching_days": "符合天数",
+    "total_days": "统计天数",
+    "matching_percentage": "符合占比",
+    "matching_organizations": "符合机构数",
+    "total_organizations": "机构总数",
+    "population_size": "参与机构数",
+    "threshold_met": "是否达标",
+    "condition_met": "是否满足条件",
+    "performance_label": "表现评价",
+    "extrema_type": "极值类型",
+    "maximum_date": "最高值日期",
+    "maximum_rank": "最高排名",
+    "maximum_value": "最高值",
+    "minimum_date": "最低值日期",
+    "minimum_rank": "最低排名",
+    "minimum_value": "最低值",
+    "mom_value": "上期值",
+    "mom_change": "环比变动",
+    "yoy_value": "同期值",
+    "yoy_change": "同比变动",
     "unit": "单位",
 }
 NEXT_TIME_LEVEL: dict[TimeGranularity, TimeGranularity | None] = {
@@ -112,6 +167,7 @@ class ProductQueryService:
         self.store = store or ProductStore(core.settings.product_db_path)
         self.charts = ChartRecommender(core.catalog)
         self.final_answers = final_answers or FinalAnswerGenerator(core.settings)
+        self.metric_data_importer = MetricDataImporter(core.db_path)
         self._security_lock = Lock()
 
     def query(
@@ -873,6 +929,68 @@ class ProductQueryService:
             "open_alert_count": len(self.store.list_alerts(status="open")),
         }
 
+    def admin_metrics(self, user: UserContext) -> list[dict[str, str]]:
+        self._require_admin(user)
+        return self.metric_data_importer.list_metrics()
+
+    def preview_metric_data_import(
+        self,
+        content: bytes,
+        file_name: str,
+        user: UserContext,
+    ) -> dict[str, Any]:
+        self._require_admin(user)
+        preview = self.metric_data_importer.preview(content, file_name)
+        self._audit(
+            user,
+            "data_import.previewed",
+            "low" if preview["valid"] else "medium",
+            {
+                "file_name": preview["file_name"],
+                "file_hash": preview["file_hash"],
+                "valid": preview["valid"],
+                "insert_count": preview["insert_count"],
+                "overwrite_count": preview["overwrite_count"],
+                "unchanged_count": preview["unchanged_count"],
+                "errors": preview["errors"],
+            },
+        )
+        return preview
+
+    def publish_metric_data_import(
+        self,
+        content: bytes,
+        file_name: str,
+        user: UserContext,
+        *,
+        confirm_overwrite: bool,
+    ) -> dict[str, Any]:
+        self._require_admin(user)
+        result = self.metric_data_importer.publish(
+            content,
+            file_name,
+            confirm_overwrite=confirm_overwrite,
+        )
+        self._audit(
+            user,
+            "data_import.published",
+            "medium" if result["overwrite_count"] else "low",
+            {
+                "file_name": result["file_name"],
+                "file_hash": result["file_hash"],
+                "upload_mode": result["upload_mode"],
+                "insert_count": result["insert_count"],
+                "overwrite_count": result["overwrite_count"],
+                "unchanged_count": result["unchanged_count"],
+                "duplicate_count": result["duplicate_count"],
+                "metric_ids": result["metric_ids"],
+                "date_start": result["date_start"],
+                "date_end": result["date_end"],
+                "overwrite_details": result["overwrite_details"],
+            },
+        )
+        return result
+
     def admin_users(self, user: UserContext) -> list[dict[str, Any]]:
         self._require_admin(user)
         return self.store.list_audit_users()
@@ -1051,13 +1169,34 @@ class ProductQueryService:
             output.append(
                 DataColumn(
                     key=key,
-                    label=COLUMN_LABELS.get(key, key),
+                    label=self._column_label(key, plan),
                     data_type=data_type,
                     unit=unit if key in VALUE_COLUMNS else "",
                     sensitive=sensitive and key in VALUE_COLUMNS,
                 )
             )
         return tuple(output)
+
+    def export_headers(self, record: dict[str, Any]) -> tuple[str, ...]:
+        plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+        return tuple(
+            self._column_label(str(column), plan)
+            for column in record.get("columns", ())
+        )
+
+    def _column_label(self, key: str, plan: dict[str, Any]) -> str:
+        metrics = tuple(plan.get("metrics") or ())
+        metric_index = {"numerator": 0, "denominator": 1}.get(key)
+        if metric_index is not None and len(metrics) > metric_index:
+            metric = self.core.catalog.metrics.get(str(metrics[metric_index]))
+            if metric:
+                return metric.name
+        if key == "derived_value":
+            definition = DERIVED_METRICS.get(str(plan.get("derived_formula") or ""))
+            aliases = definition.get("aliases") if definition else None
+            if isinstance(aliases, tuple) and aliases:
+                return str(aliases[0])
+        return COLUMN_LABELS.get(key, key)
 
     def _build_insight(
         self,

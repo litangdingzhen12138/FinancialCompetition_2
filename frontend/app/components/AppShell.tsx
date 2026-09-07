@@ -137,8 +137,18 @@ export function AppShell({ children }: { children: ReactNode }) {
 
       <main className="app-main">
         <header className="topbar">
-          <div>
+          <div className="topbar-heading">
             <p className="eyebrow">经营分析</p>
+            {pathname === "/" && (
+              <div className="topbar-workbench-intro">
+                <strong>
+                  从一句业务问题，到一份<span>可信结论</span>
+                </strong>
+                <small>
+                  自动完成语义理解、SQL 生成、安全执行、智能出图与业务解释，让经营数据真正进入决策现场。
+                </small>
+              </div>
+            )}
           </div>
           <div className="topbar-actions">
             <div className="profile">
@@ -158,7 +168,13 @@ export function AppShell({ children }: { children: ReactNode }) {
             </button>
           </div>
         </header>
-        <div className="page-content">{children}</div>
+        <div
+          className={
+            pathname === "/" ? "page-content workbench-page-content" : "page-content"
+          }
+        >
+          {children}
+        </div>
       </main>
 
       <nav className="mobile-nav" aria-label="移动端主导航">

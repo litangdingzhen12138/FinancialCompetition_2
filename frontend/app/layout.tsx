@@ -43,7 +43,18 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
-      <body>{children}</body>
+      <body>
+        {children}
+        <footer className="site-filing-footer" aria-label="网站备案信息">
+          <a
+            href="https://beian.miit.gov.cn/"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            陕ICP备2026022362号
+          </a>
+        </footer>
+      </body>
     </html>
   );
 }

@@ -9,6 +9,7 @@ import re
 
 import duckdb
 
+from .database_lock import database_lock
 from .errors import QueryExecutionError
 from .models import DataAccessScope, QueryResult
 
@@ -102,43 +103,45 @@ class DuckDBExecutor:
         sql: str,
         scope: DataAccessScope | None = None,
     ) -> None:
-        connection = duckdb.connect(str(self.db_path), read_only=True)
-        try:
-            self._apply_scope(connection, scope)
-            connection.execute("EXPLAIN " + sql).fetchall()
-        except Exception as exc:
-            raise QueryExecutionError(
-                f"SQL预检失败：{type(exc).__name__}", retry_feedback=_feedback(exc)
-            ) from exc
-        finally:
-            connection.close()
+        with database_lock(self.db_path):
+            connection = duckdb.connect(str(self.db_path), read_only=True)
+            try:
+                self._apply_scope(connection, scope)
+                connection.execute("EXPLAIN " + sql).fetchall()
+            except Exception as exc:
+                raise QueryExecutionError(
+                    f"SQL预检失败：{type(exc).__name__}", retry_feedback=_feedback(exc)
+                ) from exc
+            finally:
+                connection.close()
 
     def execute(
         self,
         sql: str,
         scope: DataAccessScope | None = None,
     ) -> QueryResult:
-        connection = duckdb.connect(str(self.db_path), read_only=True)
-        try:
-            connection.execute("SET memory_limit='1GB'")
-            connection.execute("SET threads=4")
-            self._apply_scope(connection, scope)
-            cursor = connection.execute(sql)
-            if cursor.description is None:
-                raise QueryExecutionError("查询没有返回结果集")
-            columns = tuple(str(item[0]) for item in cursor.description)
-            raw_rows = cursor.fetchmany(self.hard_limit + 1)
-            truncated = len(raw_rows) > self.hard_limit
-            rows = tuple(
-                tuple(_json_safe(value) for value in row)
-                for row in raw_rows[: self.hard_limit]
-            )
-            return QueryResult(columns, rows, truncated)
-        except QueryExecutionError:
-            raise
-        except Exception as exc:
-            raise QueryExecutionError(
-                f"查询执行失败：{type(exc).__name__}", retry_feedback=_feedback(exc)
-            ) from exc
-        finally:
-            connection.close()
+        with database_lock(self.db_path):
+            connection = duckdb.connect(str(self.db_path), read_only=True)
+            try:
+                connection.execute("SET memory_limit='1GB'")
+                connection.execute("SET threads=4")
+                self._apply_scope(connection, scope)
+                cursor = connection.execute(sql)
+                if cursor.description is None:
+                    raise QueryExecutionError("查询没有返回结果集")
+                columns = tuple(str(item[0]) for item in cursor.description)
+                raw_rows = cursor.fetchmany(self.hard_limit + 1)
+                truncated = len(raw_rows) > self.hard_limit
+                rows = tuple(
+                    tuple(_json_safe(value) for value in row)
+                    for row in raw_rows[: self.hard_limit]
+                )
+                return QueryResult(columns, rows, truncated)
+            except QueryExecutionError:
+                raise
+            except Exception as exc:
+                raise QueryExecutionError(
+                    f"查询执行失败：{type(exc).__name__}", retry_feedback=_feedback(exc)
+                ) from exc
+            finally:
+                connection.close()
