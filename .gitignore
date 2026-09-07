@@ -10,6 +10,7 @@ __pycache__/
 .env
 .env.production
 deploy-data/
+certs/
 
 # Virtual environment
 .venv/
@@ -36,3 +37,20 @@ frontend/.codex-vinext-*.log
 
 # Office temp/lock files
 ~$*
+
+# 比赛资料与隐私数据（仅本地保留，不入库）
+/比赛规则相关/
+/比赛数据/
+/最终上传/
+/.tmp/
+
+# 批量测试与报告产出（非核心，仅本地保留）
+/results/
+/api_batch_test.py
+/batch_test.py
+/wyk_full_test.py
+/finalize_*.py
+/make_submission.py
+/add_answer_mode.py
+/server-*.log
+*.tar.gz
